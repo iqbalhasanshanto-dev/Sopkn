@@ -95,10 +95,12 @@ class DictationPillOverlay(QWidget):
         super().__init__(parent)
 
         # macOS Focus-Safe, Shadow-Safe & Translucent Window Setup
+        # Note: Do not use Qt.Tool as macOS automatically hides Qt.Tool windows when
+        # another app is active. Use Qt.Window with native NSWindow configuration instead.
         self.setWindowFlags(
-            Qt.WindowStaysOnTopHint
+            Qt.Window
             | Qt.FramelessWindowHint
-            | Qt.Tool
+            | Qt.WindowStaysOnTopHint
             | Qt.WindowDoesNotAcceptFocus
             | Qt.NoDropShadowWindowHint
         )
@@ -226,6 +228,37 @@ class DictationPillOverlay(QWidget):
         y = int(geo.y() + geo.height() - self.BOTTOM_INSET - self.PADDING - self._current_h)
 
         self.setGeometry(x, y, win_w, win_h)
+
+    # -------------------------------------------------------------------------
+    # macOS Window Configuration
+    # -------------------------------------------------------------------------
+
+    def showEvent(self, event) -> None:
+        """Configure native macOS NSWindow attributes when shown."""
+        super().showEvent(event)
+        self._configure_macos_window()
+
+    def _configure_macos_window(self) -> None:
+        """Configure native macOS NSWindow so the pill stays visible across all Spaces and apps."""
+        try:
+            import AppKit
+            import objc
+
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            ns_window = ns_view.window() if ns_view is not None else None
+            if ns_window is not None:
+                # Do not hide when Python/Spokn loses active application focus
+                ns_window.setHidesOnDeactivate_(False)
+                # Float permanently above standard application windows
+                ns_window.setLevel_(AppKit.NSFloatingWindowLevel)
+                # Display across all desktop Spaces, full-screen apps, and stay stationary
+                ns_window.setCollectionBehavior_(
+                    AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                    | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+                    | AppKit.NSWindowCollectionBehaviorStationary
+                )
+        except Exception as exc:
+            print(f"[Spokn] Notice configuring macOS window: {exc}", flush=True)
 
     # -------------------------------------------------------------------------
     # Painting
