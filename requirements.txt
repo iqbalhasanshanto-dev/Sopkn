@@ -1,0 +1,14 @@
+# MLX-powered Whisper speech-to-text inference on Apple Silicon
+mlx-whisper
+
+# Real-time microphone audio capture
+sounddevice
+
+# Numerical data manipulation and buffer handling
+numpy
+
+# Audio file manipulation and signal processing
+scipy
+
+# Global hotkey listening and keyboard automation (Cmd+V)
+pynput
