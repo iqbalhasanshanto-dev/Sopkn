@@ -12,6 +12,7 @@ Exact implementation of the macOS Dictation Pill design from Figma:
 from __future__ import annotations
 
 from enum import Enum
+import math
 import signal
 import sys
 from typing import List
@@ -83,13 +84,9 @@ class DictationPillOverlay(QWidget):
     COLOR_CANCEL_BG = QColor(255, 255, 255, 46) # Semi-transparent grey face (~18% white)
     COLOR_DOT_INACTIVE = QColor(255, 255, 255, 76) # Inactive dot grey (~30% white)
 
-    # Figma Waveform Bar Patterns (heights in px)
+    # Figma Waveform Layout Constants (10 vertical bars, 2 px width, 3 px gap, 1 px radius)
     WAVEFORM_FLAT = [2.0] * 10
-    WAVEFORM_PATTERNS = [
-        [6.0, 10.0, 14.0, 18.0, 12.0, 16.0, 10.0, 14.0, 8.0, 5.0],   # Pattern A
-        [10.0, 14.0, 8.0, 6.0, 16.0, 18.0, 14.0, 12.0, 10.0, 6.0],   # Pattern B
-        [8.0, 6.0, 16.0, 12.0, 18.0, 10.0, 14.0, 6.0, 10.0, 14.0],   # Pattern C
-    ]
+    BELL_WEIGHTS = [0.35, 0.52, 0.74, 0.92, 1.00, 1.00, 0.92, 0.74, 0.52, 0.35]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -112,8 +109,11 @@ class DictationPillOverlay(QWidget):
         self._current_w = self.STATE_SIZES[PillState.IDLE][0]
         self._current_h = self.STATE_SIZES[PillState.IDLE][1]
 
-        # Live audio amplitude level for mic-reactive waveform (0.0 to 1.0)
+        # Live vocal waveform amplitude tracking and bar heights
         self._audio_level = 0.0
+        self._smoothed_level = 0.0
+        self._bar_heights = [2.0] * 10
+        self._anim_phase = 0.0
 
         # Spring morph animation (220 ms OutBack)
         self._morph_anim = QVariantAnimation(self)
@@ -123,10 +123,9 @@ class DictationPillOverlay(QWidget):
         self._morph_anim.setEasingCurve(spring_curve)
         self._morph_anim.valueChanged.connect(self._on_morph_frame)
 
-        # 120 ms waveform animation cycle for Speaking state
-        self._waveform_pattern_idx = 0
+        # ~30 FPS (33 ms) waveform animation timer for live vocal amplitude
         self._waveform_timer = QTimer(self)
-        self._waveform_timer.setInterval(120)
+        self._waveform_timer.setInterval(33)
         self._waveform_timer.timeout.connect(self._on_waveform_tick)
 
         # 160 ms pulsing sequencer for Processing dots
@@ -161,11 +160,15 @@ class DictationPillOverlay(QWidget):
         target_w, target_h = self.STATE_SIZES[state]
 
         # Manage animation timers based on new state
-        if state == PillState.SPEAKING:
+        if state in (PillState.LISTENING, PillState.SPEAKING):
             if not self._waveform_timer.isActive():
                 self._waveform_timer.start()
         else:
             self._waveform_timer.stop()
+            self._audio_level = 0.0
+            self._smoothed_level = 0.0
+            self._bar_heights = [2.0] * 10
+            self._anim_phase = 0.0
 
         if state == PillState.PROCESSING:
             if not self._processing_timer.isActive():
@@ -187,8 +190,6 @@ class DictationPillOverlay(QWidget):
     def set_audio_level(self, level: float) -> None:
         """Modulate the waveform bar heights based on live audio amplitude (0.0 to 1.0)."""
         self._audio_level = max(0.0, min(1.0, level))
-        if self._state == PillState.SPEAKING:
-            self.update()
 
     # -------------------------------------------------------------------------
     # Geometry & Animation Callbacks
@@ -202,8 +203,32 @@ class DictationPillOverlay(QWidget):
         self.update()
 
     def _on_waveform_tick(self) -> None:
-        """Advance the waveform cycle pattern in Speaking state every 120 ms."""
-        self._waveform_pattern_idx = (self._waveform_pattern_idx + 1) % len(self.WAVEFORM_PATTERNS)
+        """Advance the live vocal waveform at ~30 FPS (33 ms) with fast attack and smooth decay."""
+        target = self._audio_level
+
+        # Fast attack (rapid rise on speech onset) / smooth decay (natural release)
+        if target > self._smoothed_level:
+            self._smoothed_level += (target - self._smoothed_level) * 0.45
+        else:
+            self._smoothed_level += (target - self._smoothed_level) * 0.18
+
+        # Settle flat if below threshold to prevent microscopic oscillation during pauses
+        if self._smoothed_level < 0.005:
+            self._smoothed_level = 0.0
+            self._bar_heights = [2.0] * 10
+            self.update()
+            return
+
+        self._anim_phase += 0.25
+
+        # Center-weighted bell curve with organic variation proportional to speech level
+        heights = []
+        for i, weight in enumerate(self.BELL_WEIGHTS):
+            ripple = 1.0 + 0.15 * math.sin(self._anim_phase + i * 0.85)
+            h = 2.0 + 16.0 * self._smoothed_level * weight * ripple
+            heights.append(max(2.0, min(18.0, h)))
+
+        self._bar_heights = heights
         self.update()
 
     def _on_processing_tick(self) -> None:
@@ -349,7 +374,7 @@ class DictationPillOverlay(QWidget):
 
         # Waveform (center): 10 bars, total width 47 px
         wave_left = pill_rect.center().x() - 47.0 / 2.0
-        is_active = (self._state == PillState.SPEAKING)
+        is_active = self._state in (PillState.LISTENING, PillState.SPEAKING)
         self._paint_waveform(painter, wave_left, cy, is_active=is_active)
 
         # Stop Button (right): 24 × 24 px circle at x = pill_right - 6 - 24
@@ -452,13 +477,7 @@ class DictationPillOverlay(QWidget):
         bar_width = 2.0
         bar_gap = 3.0
 
-        if is_active:
-            base_pattern = self.WAVEFORM_PATTERNS[self._waveform_pattern_idx]
-            # Modulate with audio level if available
-            scale = 0.3 + 0.7 * self._audio_level if self._audio_level > 0.0 else 1.0
-            heights = [max(2.0, h * scale) for h in base_pattern]
-        else:
-            heights = self.WAVEFORM_FLAT
+        heights = self._bar_heights if is_active else self.WAVEFORM_FLAT
 
         for i, h in enumerate(heights):
             x = start_x + i * (bar_width + bar_gap)

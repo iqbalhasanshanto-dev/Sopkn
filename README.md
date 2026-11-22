@@ -78,6 +78,25 @@ All customizable settings are located in [`config.py`](file:///Users/shanto/Deve
 
 ---
 
+## Custom Auto-Corrections
+
+You can customize domain-specific word or phrase replacements by copying [`corrections.example.json`](file:///Users/shanto/Developer/Spokn/corrections.example.json) to `corrections.json` (gitignored for privacy):
+
+```bash
+cp corrections.example.json corrections.json
+```
+
+Add your personal replacements to `corrections.json`:
+```json
+{
+  "pie side": "PySide6",
+  "code forces": "Codeforces"
+}
+```
+Replacements are reloaded dynamically on each transcription without needing to restart Spokn.
+
+---
+
 ## Running Spokn
 
 Run the entry point from your virtual environment:

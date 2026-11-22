@@ -31,3 +31,6 @@ env/
 *.wav
 *.mp3
 scratch/
+
+# User-specific dictionary corrections
+corrections.json

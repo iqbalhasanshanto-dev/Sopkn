@@ -335,9 +335,9 @@ class DictationApp:
         # Audio recorder (no Qt callbacks inside audio thread)
         self.recorder = AudioRecorder()
 
-        # 60 ms polling timer on Qt main thread for reading latest RMS volume
+        # 33 ms (~30 FPS) polling timer on Qt main thread for reading latest RMS volume
         self._level_timer = QTimer()
-        self._level_timer.setInterval(60)
+        self._level_timer.setInterval(33)
         self._level_timer.timeout.connect(self._poll_audio_level)
 
         # State tracking
@@ -439,7 +439,7 @@ class DictationApp:
         print(f"[{config.APP_NAME}] Ready.", flush=True)
 
     def _poll_audio_level(self) -> None:
-        """Polled on Qt main thread every 60 ms while recording to update UI state and waveform."""
+        """Polled on Qt main thread every 33 ms while recording to update UI state and waveform."""
         if not self.recorder.is_recording:
             return
 
@@ -450,9 +450,16 @@ class DictationApp:
             self._current_state = PillState.SPEAKING
             self.overlay.set_state(PillState.SPEAKING)
 
-        # Modulate waveform bar heights with live mic amplitude
-        if self._current_state == PillState.SPEAKING:
-            level = min(1.0, rms * 10.0)
+        # Modulate waveform bar heights with live mic amplitude using noise gate & nonlinear curve
+        if self._current_state in (PillState.LISTENING, PillState.SPEAKING):
+            noise_floor = config.SPEECH_THRESHOLD * 0.5
+            if rms <= noise_floor:
+                level = 0.0
+            else:
+                # Map from noise floor to peak speech (approx 0.12 RMS)
+                raw_norm = min(1.0, (rms - noise_floor) / max(1e-5, (0.12 - noise_floor)))
+                # Perceptual power curve (gamma ~0.7) for responsive visual feedback
+                level = raw_norm ** 0.7
             self.overlay.set_audio_level(level)
 
     def process_audio(self, audio: np.ndarray) -> None:
