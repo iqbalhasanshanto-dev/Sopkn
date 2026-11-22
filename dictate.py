@@ -23,6 +23,7 @@ import time
 import numpy as np
 from pynput import keyboard
 import sounddevice as sd
+import mlx_whisper
 
 import config
 
@@ -134,6 +135,61 @@ class AudioRecorder:
         return audio_float32
 
 
+class Transcriber:
+    """Manages local speech-to-text inference with mlx-whisper on Apple Silicon."""
+
+    def __init__(self, model_repo: str = config.MODEL_REPO) -> None:
+        """Initialize Transcriber with the configured Hugging Face / MLX model repo."""
+        self.model_repo = model_repo
+
+    def warm_up(self) -> None:
+        """Warm up the MLX model and Apple Silicon unified memory before live dictation.
+
+        Why run a silent warm-up at startup:
+        1. Model Weights & Compilation: On first launch, huggingface_hub downloads
+           the model weights if not already cached. MLX then compiles computation
+           graphs and loads the neural weights into unified memory.
+        2. Eliminates Cold-Start Latency Spike: The initial inference call typically
+           incurs a 1-3 second warm-up delay. By passing a 1-second silent audio buffer
+           at application startup, the very first user dictation transcribes with
+           instant, responsive latency.
+        """
+        print(f"[{config.APP_NAME}] Loading model ({self.model_repo})...", flush=True)
+        try:
+            # 1 second of silent float32 audio at 16kHz
+            silent_audio = np.zeros(config.SAMPLE_RATE, dtype=np.float32)
+            mlx_whisper.transcribe(silent_audio, path_or_hf_repo=self.model_repo)
+            print(f"[{config.APP_NAME}] Model ready.", flush=True)
+        except Exception as exc:
+            print(
+                f"[{config.APP_NAME}] Warning during model warm-up: {exc}",
+                flush=True,
+            )
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Transcribe a normalized 1D float32 numpy audio buffer to text.
+
+        Why passing float32 numpy array directly avoids disk I/O:
+        Traditional transcription wrappers write audio chunks to temporary .wav files
+        on disk, which introduces file system I/O latency, locks, and SSD write wear.
+        mlx-whisper accepts an in-memory 1D float32 numpy array directly. Audio flows
+        seamlessly from microphone memory buffers straight into Apple Silicon Metal/GPU
+        unified memory with zero disk round-trips.
+
+        Returns:
+            str: Stripped transcribed text, or empty string on error or no speech.
+        """
+        try:
+            result = mlx_whisper.transcribe(audio, path_or_hf_repo=self.model_repo)
+            return result.get("text", "").strip()
+        except Exception as exc:
+            print(
+                f"[{config.APP_NAME}] Transcription error: {exc}",
+                flush=True,
+            )
+            return ""
+
+
 def get_hotkey() -> keyboard.Key:
     """Resolve the configured hotkey string to a pynput keyboard.Key enum value.
 
@@ -163,13 +219,18 @@ class DictationApp:
       key-press events at the OS key-repeat rate. Guarding with `not recorder.is_recording`
       and `not is_processing` prevents key-repeat events from restarting or corrupting
       the recording while the user is simply holding down the key.
-    - Asynchronous Processing: Heavy processing (and later, Whisper inference) runs
-      on a background daemon thread (`process_audio`). This ensures the pynput listener
+    - Asynchronous Processing: Heavy processing and MLX Whisper inference run on a
+      background daemon thread (`process_audio`). This ensures the pynput listener
       event loop is never blocked, keeping hotkey detection immediate and fluid.
     """
 
-    def __init__(self, recorder: AudioRecorder | None = None) -> None:
+    def __init__(
+        self,
+        recorder: AudioRecorder | None = None,
+        transcriber: Transcriber | None = None,
+    ) -> None:
         self.recorder = recorder or AudioRecorder()
+        self.transcriber = transcriber or Transcriber()
         self.target_hotkey = get_hotkey()
         self.is_processing = False
         self._lock = threading.Lock()
@@ -218,22 +279,20 @@ class DictationApp:
         worker.start()
 
     def process_audio(self, audio: np.ndarray) -> None:
-        """Process captured audio on a background worker thread (Phase 2.2 stub).
+        """Process captured audio on a background worker thread.
 
-        Marks `is_processing = True` to prevent new recordings while processing,
-        logs the captured audio duration, and resets `is_processing = False` in a
-        finally block before printing Ready.
+        Transcribes the normalized float32 buffer with mlx-whisper and prints
+        the resulting text.
         """
         with self._lock:
             self.is_processing = True
 
         try:
-            duration = len(audio) / config.SAMPLE_RATE
-            print(
-                f"[{config.APP_NAME}] Captured {duration:.2f}s of audio "
-                f"(ready for Phase 3 transcription).",
-                flush=True,
-            )
+            text = self.transcriber.transcribe(audio)
+            if not text:
+                print(f"[{config.APP_NAME}] No speech detected.", flush=True)
+            else:
+                print(f"[{config.APP_NAME}] Transcribed: {text}", flush=True)
         finally:
             with self._lock:
                 self.is_processing = False
@@ -241,6 +300,7 @@ class DictationApp:
 
     def run(self) -> None:
         """Start the keyboard listener and wait for events until interrupted."""
+        self.transcriber.warm_up()
         print(
             f"[{config.APP_NAME}] Ready. Hold Right Option to talk (Ctrl+C to quit).",
             flush=True,
