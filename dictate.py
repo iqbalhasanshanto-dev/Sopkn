@@ -11,13 +11,14 @@ High-Level V1 Flow:
    - Releasing the key stops recording.
    - If duration >= MIN_RECORDING_DURATION, pass the buffer to the local MLX Whisper model.
 4. Paste & Restore:
-   - Back up current clipboard content.
-   - Copy transcribed text to the clipboard and simulate Cmd+V via pynput.
+   - Back up current clipboard content using pbpaste.
+   - Copy transcribed text to the clipboard using pbcopy and simulate Cmd+V via osascript.
    - After CLIPBOARD_RESTORE_DELAY, restore the previous clipboard content.
 """
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 import numpy as np
@@ -190,6 +191,93 @@ class Transcriber:
             return ""
 
 
+def get_clipboard() -> str | None:
+    """Read the current text content from the macOS system clipboard using pbpaste.
+
+    Returns:
+        str | None: Clipboard string content on success, or None on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["pbpaste"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return None
+    except Exception:
+        return None
+
+
+def set_clipboard(text: str) -> None:
+    """Write text to the macOS system clipboard using pbcopy.
+
+    Args:
+        text: The string to place onto the clipboard.
+    """
+    subprocess.run(
+        ["pbcopy"],
+        input=text,
+        text=True,
+        check=True,
+    )
+
+
+def paste_text(text: str) -> bool:
+    """Copy text to clipboard, simulate Cmd+V via osascript, and restore prior clipboard.
+
+    Why wait CLIPBOARD_RESTORE_DELAY before restoring:
+    Target macOS applications (Electron, browsers, terminals, text editors) process
+    simulated Cmd+V asynchronously from their respective OS run-loops. If pbcopy
+    restores the old clipboard content too quickly (e.g. immediately after keystroke),
+    the target application might paste the previously restored clipboard content
+    instead of the transcribed text. A short pause (config.CLIPBOARD_RESTORE_DELAY)
+    guarantees the active application has consumed the transcribed text before
+    the original clipboard is restored.
+
+    Why paste errors are caught:
+    Simulating keystrokes via AppleScript requires macOS Accessibility permissions
+    (System Settings -> Privacy & Security -> Accessibility). If permissions are
+    missing, revoked, or an OS error occurs, catching the exception ensures the
+    background thread logs a clean diagnostic warning and DictationApp returns
+    gracefully to Ready state without crashing the global hotkey listener.
+
+    Returns:
+        bool: True if paste succeeded, False otherwise.
+    """
+    previous_clipboard = get_clipboard()
+    try:
+        set_clipboard(text)
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "System Events" to keystroke "v" using command down',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        time.sleep(config.CLIPBOARD_RESTORE_DELAY)
+        return True
+    except Exception as exc:
+        print(
+            f"[{config.APP_NAME}] Failed to paste text: {exc}\n"
+            f"Please ensure Accessibility permissions are granted under "
+            f"System Settings -> Privacy & Security -> Accessibility.",
+            flush=True,
+        )
+        return False
+    finally:
+        if previous_clipboard is not None:
+            try:
+                set_clipboard(previous_clipboard)
+            except Exception:
+                pass
+
+
 def get_hotkey() -> keyboard.Key:
     """Resolve the configured hotkey string to a pynput keyboard.Key enum value.
 
@@ -213,8 +301,9 @@ class DictationApp:
 
     macOS Permissions & Architecture Notes:
     - Accessibility Permission: pynput monitors global key events via macOS Quartz
-      event taps (CGEventTap). Terminal apps must be granted Accessibility permissions
-      under System Settings -> Privacy & Security -> Accessibility.
+      event taps (CGEventTap), and osascript simulates Cmd+V keystrokes. Terminal
+      apps must be granted Accessibility permissions under System Settings ->
+      Privacy & Security -> Accessibility.
     - Key-Repeat Protection: When a physical key is held down, macOS fires repeated
       key-press events at the OS key-repeat rate. Guarding with `not recorder.is_recording`
       and `not is_processing` prevents key-repeat events from restarting or corrupting
@@ -281,8 +370,8 @@ class DictationApp:
     def process_audio(self, audio: np.ndarray) -> None:
         """Process captured audio on a background worker thread.
 
-        Transcribes the normalized float32 buffer with mlx-whisper and prints
-        the resulting text.
+        Transcribes the normalized float32 buffer with mlx-whisper, prints
+        the resulting text, and simulates Cmd+V paste at the active cursor.
         """
         with self._lock:
             self.is_processing = True
@@ -293,6 +382,7 @@ class DictationApp:
                 print(f"[{config.APP_NAME}] No speech detected.", flush=True)
             else:
                 print(f"[{config.APP_NAME}] Transcribed: {text}", flush=True)
+                paste_text(text)
         finally:
             with self._lock:
                 self.is_processing = False
