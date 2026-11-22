@@ -12,3 +12,6 @@ scipy
 
 # Global hotkey listening and keyboard automation (Cmd+V)
 pynput
+
+# Native macOS desktop overlay UI (Qt 6)
+PySide6
