@@ -5,20 +5,25 @@ Architecture & V1 Flow:
 1. UI Initialization & Model Warm-Up:
    - Initialize PySide6 QApplication and display the DictationPillOverlay in IDLE state.
    - Run MLX Whisper warm-up asynchronously in a background thread so the UI appears instantly.
-2. Dual Trigger Dictation (Hold-to-Talk or Click-to-Toggle):
-   - Hold Right Option (HOTKEY) or click the IDLE pill to start microphone recording (LISTENING).
-   - Once microphone RMS exceeds SPEECH_THRESHOLD, transition to SPEAKING with live waveform modulation.
-3. Release or Stop:
-   - Releasing the hotkey or clicking Stop transitions to COLLAPSING -> PROCESSING.
-   - Clicking × Cancel at any time cancels recording and resets directly to IDLE.
-4. Local Inference & Paste:
-   - In-memory float32 audio is transcribed with mlx-whisper (conditioned on language & vocabulary hints).
+2. Press-to-Toggle Dictation (Right Option or Click-to-Toggle):
+   - Press Right Option (HOTKEY) or click the IDLE pill to start microphone recording (LISTENING).
+   - Audio thread computes RMS volume internally without emitting Qt signals, avoiding deadlocks.
+   - Qt main thread polls latest RMS on a 60 ms timer: transitions to SPEAKING once RMS >= SPEECH_THRESHOLD,
+     modulating the live waveform smoothly.
+3. Stop or Cancel:
+   - Press Right Option again (or click Stop on the pill) to stop recording and transition to COLLAPSING -> PROCESSING.
+   - Click × Cancel at any time to discard audio and immediately return to IDLE.
+4. Local Inference, Corrections & Paste:
+   - In-memory float32 audio is transcribed with mlx-whisper on a background thread.
+   - Word/phrase corrections from corrections.json are applied automatically.
    - Copies transcript to clipboard, simulates Cmd+V via osascript, and restores prior clipboard.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -38,24 +43,61 @@ from overlay import DictationPillOverlay, PillState
 class UiBridge(QObject):
     """Thread-safe signal bridge communicating between background threads and the Qt UI."""
 
+    hotkey_toggled = Signal()
     state_changed = Signal(object)  # PillState
-    audio_level = Signal(float)     # float (0.0 to 1.0)
+
+
+def apply_corrections(text: str) -> str:
+    """Apply word/phrase replacements from corrections.json using whole-word regex."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    corrections_path = Path(__file__).parent / "corrections.json"
+    if not corrections_path.exists():
+        return text
+
+    try:
+        with open(corrections_path, "r", encoding="utf-8") as f:
+            replacements: dict[str, str] = json.load(f)
+    except Exception as exc:
+        print(f"[{config.APP_NAME}] Warning reading corrections.json: {exc}", flush=True)
+        return text
+
+    corrected = text
+    for pattern, replacement in replacements.items():
+        # Match whole word/phrase with case-insensitivity
+        regex = rf"\b{re.escape(pattern)}\b"
+        corrected = re.sub(regex, replacement, corrected, flags=re.IGNORECASE)
+
+    return corrected
 
 
 class AudioRecorder:
-    """Handles real-time microphone audio capture and normalization using sounddevice."""
+    """Handles real-time microphone audio capture and normalization using sounddevice.
 
-    def __init__(self, level_callback: Callable[[float], None] | None = None) -> None:
+    Thread Safety:
+    - Never calls Qt functions or emits Qt signals from _audio_callback (the PortAudio
+      real-time audio thread).
+    - Computes RMS volume and stores it in self._latest_rms for the Qt main thread
+      to poll safely at its own frequency via QTimer.
+    """
+
+    def __init__(self) -> None:
         """Initializes internal audio chunk buffer, recording flag, and stream handle."""
         self._buffer: list[np.ndarray] = []
         self._is_recording: bool = False
         self._stream: sd.InputStream | None = None
-        self._level_callback = level_callback
+        self._latest_rms: float = 0.0
 
     @property
     def is_recording(self) -> bool:
         """Return whether audio is currently actively recording."""
         return self._is_recording
+
+    @property
+    def latest_rms(self) -> float:
+        """Return the most recent RMS volume computed on the audio thread."""
+        return self._latest_rms
 
     def _audio_callback(
         self,
@@ -73,22 +115,18 @@ class AudioRecorder:
             # store an explicit copy of each chunk.
             self._buffer.append(indata.copy())
 
-            if self._level_callback is not None:
-                # Compute normalized RMS amplitude (0.0 to 1.0) from int16 audio
-                data_float = indata.astype(np.float32) / 32768.0
-                rms = float(np.sqrt(np.mean(data_float ** 2)))
-                self._level_callback(rms)
+            # Compute normalized RMS amplitude (0.0 to 1.0) from int16 audio
+            # Fast, lock-free float assignment (no Qt calls, no callbacks)
+            data_float = indata.astype(np.float32) / 32768.0
+            self._latest_rms = float(np.sqrt(np.mean(data_float ** 2)))
 
     def start(self) -> bool:
-        """Reset buffer and open/start the sounddevice InputStream.
-
-        Returns:
-            bool: True if recording started successfully, False otherwise.
-        """
+        """Reset buffer and open/start the sounddevice InputStream."""
         if self._is_recording:
             return True
 
         self._buffer.clear()
+        self._latest_rms = 0.0
         try:
             self._stream = sd.InputStream(
                 samplerate=config.SAMPLE_RATE,
@@ -115,14 +153,9 @@ class AudioRecorder:
             return False
 
     def stop(self) -> np.ndarray | None:
-        """Stop and close the audio stream, then concatenate and normalize captured audio.
-
-        Returns:
-            np.ndarray | None: 1D float32 array normalized to [-1.0, 1.0] ready
-                for mlx-whisper, or None if no audio was captured or if the
-                recording was shorter than config.MIN_RECORDING_DURATION.
-        """
+        """Stop and close the audio stream, then concatenate and normalize captured audio."""
         self._is_recording = False
+        self._latest_rms = 0.0
 
         if self._stream is not None:
             try:
@@ -151,6 +184,7 @@ class AudioRecorder:
     def cancel(self) -> None:
         """Stop and close the audio stream, discarding captured chunks without returning audio."""
         self._is_recording = False
+        self._latest_rms = 0.0
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -288,18 +322,23 @@ class DictationApp:
         self.transcriber = transcriber or Transcriber()
         self.target_hotkey = get_hotkey()
 
-        # Thread-safe Qt signal bridge
+        # Thread-safe Qt signal bridge for cross-thread events
         self.ui_bridge = UiBridge()
+        self.ui_bridge.hotkey_toggled.connect(self.handle_hotkey_toggle)
         self.ui_bridge.state_changed.connect(self.overlay.set_state)
-        self.ui_bridge.audio_level.connect(self.overlay.set_audio_level)
 
-        # Connect overlay interactive mouse events
-        self.overlay.idle_clicked.connect(self.on_overlay_idle_clicked)
-        self.overlay.cancel_clicked.connect(self.on_overlay_cancel_clicked)
-        self.overlay.stop_clicked.connect(self.on_overlay_stop_clicked)
+        # Connect overlay interactive mouse events directly on Qt main thread
+        self.overlay.idle_clicked.connect(self.start_dictation)
+        self.overlay.cancel_clicked.connect(self.cancel_dictation)
+        self.overlay.stop_clicked.connect(self.stop_dictation)
 
-        # Audio recorder with live RMS volume callback
-        self.recorder = AudioRecorder(level_callback=self._on_audio_chunk)
+        # Audio recorder (no Qt callbacks inside audio thread)
+        self.recorder = AudioRecorder()
+
+        # 60 ms polling timer on Qt main thread for reading latest RMS volume
+        self._level_timer = QTimer()
+        self._level_timer.setInterval(60)
+        self._level_timer.timeout.connect(self._poll_audio_level)
 
         # State tracking
         self.is_ready = False
@@ -307,6 +346,7 @@ class DictationApp:
         self._current_state = PillState.IDLE
         self._lock = threading.Lock()
         self._listener: keyboard.Listener | None = None
+        self._last_hotkey_press_time: float = 0.0
 
     def start(self) -> None:
         """Show overlay, start global keyboard listener, and warm up model in background."""
@@ -325,7 +365,7 @@ class DictationApp:
             with self._lock:
                 self.is_ready = True
             print(
-                f"[{config.APP_NAME}] Ready. Hold Right Option or click pill to talk (Ctrl+C to quit).",
+                f"[{config.APP_NAME}] Ready. Press Right Option or click pill to talk (Ctrl+C to quit).",
                 flush=True,
             )
 
@@ -337,18 +377,26 @@ class DictationApp:
         warmup_thread.start()
 
     # -------------------------------------------------------------------------
-    # Dictation Control Logic
+    # Dictation Control Logic (Always executed on Qt Main Thread)
     # -------------------------------------------------------------------------
 
+    def handle_hotkey_toggle(self) -> None:
+        """Toggle dictation on/off from the hotkey on the Qt main thread."""
+        if self.recorder.is_recording:
+            self.stop_dictation()
+        else:
+            self.start_dictation()
+
     def start_dictation(self) -> None:
-        """Start audio recording and transition UI to LISTENING state."""
+        """Start audio recording, transition UI to LISTENING state, and start RMS polling."""
         with self._lock:
             if not self.is_ready or self.recorder.is_recording or self.is_processing:
                 return
 
         if self.recorder.start():
             self._current_state = PillState.LISTENING
-            self.ui_bridge.state_changed.emit(PillState.LISTENING)
+            self.overlay.set_state(PillState.LISTENING)
+            self._level_timer.start()
             print(f"[{config.APP_NAME}] Listening...", flush=True)
 
     def stop_dictation(self) -> None:
@@ -356,17 +404,20 @@ class DictationApp:
         if not self.recorder.is_recording:
             return
 
+        self._level_timer.stop()
+        self.overlay.set_audio_level(0.0)
+
         audio = self.recorder.stop()
         if audio is None:
             self._current_state = PillState.IDLE
-            self.ui_bridge.state_changed.emit(PillState.IDLE)
+            self.overlay.set_state(PillState.IDLE)
             print(f"[{config.APP_NAME}] Ignored short recording.", flush=True)
             print(f"[{config.APP_NAME}] Ready.", flush=True)
             return
 
         # Transition to COLLAPSING (which auto-morphs to PROCESSING after 220 ms)
         self._current_state = PillState.PROCESSING
-        self.ui_bridge.state_changed.emit(PillState.COLLAPSING)
+        self.overlay.set_state(PillState.COLLAPSING)
         print(f"[{config.APP_NAME}] Transcribing...", flush=True)
 
         worker = threading.Thread(
@@ -379,29 +430,33 @@ class DictationApp:
 
     def cancel_dictation(self) -> None:
         """Cancel recording immediately and return to IDLE without transcribing."""
+        self._level_timer.stop()
+        self.overlay.set_audio_level(0.0)
         self.recorder.cancel()
         self._current_state = PillState.IDLE
-        self.ui_bridge.state_changed.emit(PillState.IDLE)
+        self.overlay.set_state(PillState.IDLE)
         print(f"[{config.APP_NAME}] Dictation canceled.", flush=True)
         print(f"[{config.APP_NAME}] Ready.", flush=True)
 
-    def _on_audio_chunk(self, rms: float) -> None:
-        """Process live audio volume: switch to SPEAKING on speech, and modulate bars."""
+    def _poll_audio_level(self) -> None:
+        """Polled on Qt main thread every 60 ms while recording to update UI state and waveform."""
         if not self.recorder.is_recording:
             return
 
-        # If in LISTENING and volume crosses speech threshold, morph to SPEAKING
+        rms = self.recorder.latest_rms
+
+        # Transition from LISTENING to SPEAKING once microphone volume exceeds threshold
         if self._current_state == PillState.LISTENING and rms >= config.SPEECH_THRESHOLD:
             self._current_state = PillState.SPEAKING
-            self.ui_bridge.state_changed.emit(PillState.SPEAKING)
+            self.overlay.set_state(PillState.SPEAKING)
 
         # Modulate waveform bar heights with live mic amplitude
         if self._current_state == PillState.SPEAKING:
             level = min(1.0, rms * 10.0)
-            self.ui_bridge.audio_level.emit(level)
+            self.overlay.set_audio_level(level)
 
     def process_audio(self, audio: np.ndarray) -> None:
-        """Transcribe audio on worker thread and paste text at cursor."""
+        """Transcribe audio on worker thread, apply corrections, and paste text at cursor."""
         with self._lock:
             self.is_processing = True
 
@@ -410,46 +465,45 @@ class DictationApp:
             if not text:
                 print(f"[{config.APP_NAME}] No speech detected.", flush=True)
             else:
+                text = apply_corrections(text)
                 print(f"[{config.APP_NAME}] Transcribed: {text}", flush=True)
                 paste_text(text)
         finally:
             with self._lock:
                 self.is_processing = False
                 self._current_state = PillState.IDLE
-            self.ui_bridge.state_changed.emit(PillState.IDLE)
+            try:
+                self.ui_bridge.state_changed.emit(PillState.IDLE)
+            except RuntimeError:
+                pass
             print(f"[{config.APP_NAME}] Ready.", flush=True)
 
     # -------------------------------------------------------------------------
-    # Hotkey Event Callbacks
+    # Hotkey Event Callbacks (Executed on pynput background listener thread)
     # -------------------------------------------------------------------------
 
     def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        """Handle Right Option key press (filtered for key-repeat)."""
+        """Handle Right Option key press with debounce and bridge to Qt main thread."""
         if key != self.target_hotkey:
             return
-        self.start_dictation()
+
+        now = time.monotonic()
+        if now - self._last_hotkey_press_time < config.HOTKEY_DEBOUNCE_SECONDS:
+            return
+        self._last_hotkey_press_time = now
+
+        # Emit signal to dispatch handler onto Qt GUI main thread safely
+        self.ui_bridge.hotkey_toggled.emit()
 
     def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
         """Handle Right Option key release."""
+        if config.HOTKEY_MODE == "toggle":
+            # In toggle mode, releasing the key does not stop dictation
+            return
+
         if key != self.target_hotkey:
             return
-        self.stop_dictation()
-
-    # -------------------------------------------------------------------------
-    # Overlay Mouse Event Callbacks
-    # -------------------------------------------------------------------------
-
-    def on_overlay_idle_clicked(self) -> None:
-        """Start dictation when the resting IDLE pill is clicked."""
-        self.start_dictation()
-
-    def on_overlay_stop_clicked(self) -> None:
-        """Stop dictation and transcribe when the red Stop button is clicked."""
-        self.stop_dictation()
-
-    def on_overlay_cancel_clicked(self) -> None:
-        """Discard audio when the × Cancel button is clicked."""
-        self.cancel_dictation()
+        self.ui_bridge.hotkey_toggled.emit()
 
     # -------------------------------------------------------------------------
     # Shutdown
@@ -458,6 +512,7 @@ class DictationApp:
     def stop_and_exit(self, app: QApplication) -> None:
         """Clean up audio, listener, and overlay, then exit the application."""
         print(f"\n[{config.APP_NAME}] Exiting cleanly...", flush=True)
+        self._level_timer.stop()
         if self.recorder.is_recording:
             self.recorder.cancel()
         if self._listener is not None and self._listener.is_alive():

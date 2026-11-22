@@ -17,12 +17,20 @@ MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 LANGUAGE = "en"
 
 # Custom vocabulary hint to condition Whisper's tokenizer on domain-specific proper nouns
-INITIAL_PROMPT = "Spokn, VUPC, Codeforces, ESP32, PySide6, Antigravity, macOS, Rajshahi"
+INITIAL_PROMPT = (
+    "Spokn, Gemini, Shanto, VUPC, Codeforces, ESP32, PySide6, Antigravity, "
+    "macOS, Rajshahi, Computer Science and Engineering, astrophotography"
+)
 
 # Global hotkey configuration
-# Key to hold down to record and release to transcribe.
 # "alt_r" represents the Right Option key on macOS keyboards.
 HOTKEY = "alt_r"
+
+# Hotkey triggering behavior: "toggle" (press to start, press again to stop) or "hold"
+HOTKEY_MODE = "toggle"
+
+# Debounce delay in seconds to ignore physical key-repeat / chatter
+HOTKEY_DEBOUNCE_SECONDS = 0.35
 
 # Audio capture settings
 # Whisper requires 16kHz mono audio.

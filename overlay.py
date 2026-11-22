@@ -244,18 +244,21 @@ class DictationPillOverlay(QWidget):
             import AppKit
             import objc
 
+            NSFloatingWindowLevel = getattr(AppKit, "NSFloatingWindowLevel", 3)
+            CAN_JOIN_ALL_SPACES = getattr(AppKit, "NSWindowCollectionBehaviorCanJoinAllSpaces", 1 << 0)
+            STATIONARY = getattr(AppKit, "NSWindowCollectionBehaviorStationary", 1 << 4)
+            FULL_SCREEN_AUX = getattr(AppKit, "NSWindowCollectionBehaviorFullScreenAuxiliary", 1 << 8)
+
             ns_view = objc.objc_object(c_void_p=int(self.winId()))
             ns_window = ns_view.window() if ns_view is not None else None
             if ns_window is not None:
                 # Do not hide when Python/Spokn loses active application focus
                 ns_window.setHidesOnDeactivate_(False)
                 # Float permanently above standard application windows
-                ns_window.setLevel_(AppKit.NSFloatingWindowLevel)
+                ns_window.setLevel_(NSFloatingWindowLevel)
                 # Display across all desktop Spaces, full-screen apps, and stay stationary
                 ns_window.setCollectionBehavior_(
-                    AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
-                    | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
-                    | AppKit.NSWindowCollectionBehaviorStationary
+                    CAN_JOIN_ALL_SPACES | FULL_SCREEN_AUX | STATIONARY
                 )
         except Exception as exc:
             print(f"[Spokn] Notice configuring macOS window: {exc}", flush=True)
@@ -273,23 +276,24 @@ class DictationPillOverlay(QWidget):
         pill_rect = QRectF(self.PADDING, self.PADDING, self._current_w, self._current_h)
         corner_radius = self._current_h / 2.0
 
-        # 1. Drop shadow: subtle 0px 3px 12px rgba(0,0,0,0.20) in active states; none in idle
+        # 1. Drop shadow & subtle white rim glow in active states; none in idle
         if self._state != PillState.IDLE:
             self._paint_shadow(painter, pill_rect, corner_radius)
+            self._paint_rim_glow(painter, pill_rect, corner_radius)
 
         # 2. Pill capsule fill: solid #0A0A0A
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(self.COLOR_PILL_BG))
         painter.drawRoundedRect(pill_rect, corner_radius, corner_radius)
 
-        # 3. Inside border: 1px solid #FFFFFF (35% opacity in idle, 12% in active states)
-        border_alpha = int(255 * 0.35) if self._state == PillState.IDLE else int(255 * 0.12)
-        border_pen = QPen(QColor(255, 255, 255, border_alpha), 1.0)
+        # 3. Inside border: crisp 1.2 px solid #FFFFFF (~65% in active, ~45% in IDLE)
+        border_alpha = int(255 * 0.45) if self._state == PillState.IDLE else int(255 * 0.65)
+        border_pen = QPen(QColor(255, 255, 255, border_alpha), 1.2)
         painter.setPen(border_pen)
         painter.setBrush(Qt.NoBrush)
-        # Inset stroke by 0.5px for crisp inside 1px stroke
-        inset_rect = pill_rect.adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.drawRoundedRect(inset_rect, corner_radius - 0.5, corner_radius - 0.5)
+        # Inset stroke by 0.6px for crisp inside 1.2px stroke
+        inset_rect = pill_rect.adjusted(0.6, 0.6, -0.6, -0.6)
+        painter.drawRoundedRect(inset_rect, max(0.0, corner_radius - 0.6), max(0.0, corner_radius - 0.6))
 
         # 4. State-specific interior controls (hidden in IDLE)
         if self._state == PillState.IDLE:
@@ -301,6 +305,21 @@ class DictationPillOverlay(QWidget):
             self._paint_collapsing_contents(painter, pill_rect)
         elif self._state == PillState.PROCESSING:
             self._paint_processing_contents(painter, pill_rect)
+
+    def _paint_rim_glow(self, painter: QPainter, pill_rect: QRectF, radius: float) -> None:
+        """Paint 2-3 very tight soft white halo passes (1-3 px spread, low alpha ~10-18%)."""
+        painter.save()
+        painter.setPen(Qt.NoPen)
+        glow_passes = [
+            (3.0, int(255 * 0.10)),
+            (2.0, int(255 * 0.14)),
+            (1.0, int(255 * 0.18)),
+        ]
+        for spread, alpha in glow_passes:
+            painter.setBrush(QColor(255, 255, 255, alpha))
+            glow_rect = pill_rect.adjusted(-spread, -spread, spread, spread)
+            painter.drawRoundedRect(glow_rect, radius + spread, radius + spread)
+        painter.restore()
 
     def _paint_shadow(self, painter: QPainter, pill_rect: QRectF, radius: float) -> None:
         """Paint soft, low-alpha elevation shadow without visible outer ring artifacts."""
