@@ -23,11 +23,15 @@ INITIAL_PROMPT = (
 )
 
 # Global hotkey configuration
-# "alt_r" represents the Right Option key on macOS keyboards.
-HOTKEY = "alt_r"
+# Default: "cmd_r" represents the Right Command key on macOS.
+# Alternative: "f5" (Microphone key) or "alt_r" (Right Option).
+HOTKEY = "cmd_r"
 
-# Hotkey triggering behavior: "toggle" (press to start, press again to stop) or "hold"
-HOTKEY_MODE = "toggle"
+# Hotkey triggering behavior: "double_tap" (two quick taps of HOTKEY), "toggle", or "hold"
+HOTKEY_MODE = "double_tap"
+
+# Maximum time window in seconds between two taps for double-tap detection
+DOUBLE_TAP_WINDOW = 0.35
 
 # Debounce delay in seconds to ignore physical key-repeat / chatter
 HOTKEY_DEBOUNCE_SECONDS = 0.35
@@ -40,7 +44,8 @@ DTYPE = "int16"      # Standard 16-bit PCM integer format
 
 # Speech detection threshold
 # Normalized RMS volume threshold (0.0 to 1.0) to transition the pill from LISTENING to SPEAKING
-SPEECH_THRESHOLD = 0.015
+# Tuned for MacBook Air built-in microphone at desk distance (whisper ~0.005, desk speech ~0.015-0.035)
+SPEECH_THRESHOLD = 0.008
 
 # Recording thresholds
 # Minimum recording duration in seconds; ignore shorter keypresses to prevent accidental triggers.

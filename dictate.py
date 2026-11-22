@@ -72,14 +72,20 @@ def apply_corrections(text: str) -> str:
     return corrected
 
 
+# 10 speech-range frequency bands spanning ~120 Hz to 3800 Hz
+SPEECH_BAND_EDGES = [
+    120.0, 220.0, 360.0, 550.0, 800.0, 1200.0, 1700.0, 2300.0, 2900.0, 3400.0, 3800.0
+]
+
+
 class AudioRecorder:
     """Handles real-time microphone audio capture and normalization using sounddevice.
 
     Thread Safety:
     - Never calls Qt functions or emits Qt signals from _audio_callback (the PortAudio
       real-time audio thread).
-    - Computes RMS volume and stores it in self._latest_rms for the Qt main thread
-      to poll safely at its own frequency via QTimer.
+    - Computes peak-hold RMS volume and a 10-band speech spectrum, storing them
+      atomically for the Qt main thread to poll safely via consume_audio_levels().
     """
 
     def __init__(self) -> None:
@@ -87,7 +93,8 @@ class AudioRecorder:
         self._buffer: list[np.ndarray] = []
         self._is_recording: bool = False
         self._stream: sd.InputStream | None = None
-        self._latest_rms: float = 0.0
+        self._peak_rms: float = 0.0
+        self._peak_bands: list[float] = [0.0] * 10
 
     @property
     def is_recording(self) -> bool:
@@ -96,8 +103,16 @@ class AudioRecorder:
 
     @property
     def latest_rms(self) -> float:
-        """Return the most recent RMS volume computed on the audio thread."""
-        return self._latest_rms
+        """Return the current peak RMS volume since the last consumption."""
+        return self._peak_rms
+
+    def consume_audio_levels(self) -> tuple[float, list[float]]:
+        """Atomically read and reset peak RMS and 10-band spectrum since the last poll."""
+        rms = self._peak_rms
+        bands = list(self._peak_bands)
+        self._peak_rms = 0.0
+        self._peak_bands = [0.0] * 10
+        return rms, bands
 
     def _audio_callback(
         self,
@@ -115,10 +130,33 @@ class AudioRecorder:
             # store an explicit copy of each chunk.
             self._buffer.append(indata.copy())
 
-            # Compute normalized RMS amplitude (0.0 to 1.0) from int16 audio
-            # Fast, lock-free float assignment (no Qt calls, no callbacks)
-            data_float = indata.astype(np.float32) / 32768.0
-            self._latest_rms = float(np.sqrt(np.mean(data_float ** 2)))
+            # Convert int16 audio to float32 in range [-1.0, 1.0]
+            data_float = indata.astype(np.float32).flatten() / 32768.0
+            n_samples = len(data_float)
+            if n_samples == 0:
+                return
+
+            # Compute RMS amplitude of this chunk and update peak-hold
+            chunk_rms = float(np.sqrt(np.mean(data_float ** 2)))
+            if chunk_rms > self._peak_rms:
+                self._peak_rms = chunk_rms
+
+            # Compute 10-band speech spectrum (~120 Hz to 3800 Hz) via rfft
+            rfft_mag = np.abs(np.fft.rfft(data_float))
+            freqs = np.fft.rfftfreq(n_samples, d=1.0 / config.SAMPLE_RATE)
+            fft_norm = rfft_mag / (n_samples / 2.0)
+
+            for i in range(10):
+                f_low = SPEECH_BAND_EDGES[i]
+                f_high = SPEECH_BAND_EDGES[i + 1]
+                mask = (freqs >= f_low) & (freqs < f_high)
+                if np.any(mask):
+                    val = float(np.mean(fft_norm[mask]))
+                else:
+                    idx = int(np.argmin(np.abs(freqs - (f_low + f_high) / 2.0)))
+                    val = float(fft_norm[idx])
+                if val > self._peak_bands[i]:
+                    self._peak_bands[i] = val
 
     def start(self) -> bool:
         """Reset buffer and open/start the sounddevice InputStream."""
@@ -126,7 +164,8 @@ class AudioRecorder:
             return True
 
         self._buffer.clear()
-        self._latest_rms = 0.0
+        self._peak_rms = 0.0
+        self._peak_bands = [0.0] * 10
         try:
             self._stream = sd.InputStream(
                 samplerate=config.SAMPLE_RATE,
@@ -155,11 +194,19 @@ class AudioRecorder:
     def stop(self) -> np.ndarray | None:
         """Stop and close the audio stream, then concatenate and normalize captured audio."""
         self._is_recording = False
-        self._latest_rms = 0.0
+        self._peak_rms = 0.0
+        self._peak_bands = [0.0] * 10
 
         if self._stream is not None:
             try:
                 self._stream.stop()
+            except Exception as exc:
+                print(f"[{config.APP_NAME}] Warning stopping audio stream: {exc}", flush=True)
+                try:
+                    self._stream.abort()
+                except Exception:
+                    pass
+            try:
                 self._stream.close()
             except Exception as exc:
                 print(f"[{config.APP_NAME}] Warning closing audio stream: {exc}", flush=True)
@@ -184,13 +231,21 @@ class AudioRecorder:
     def cancel(self) -> None:
         """Stop and close the audio stream, discarding captured chunks without returning audio."""
         self._is_recording = False
-        self._latest_rms = 0.0
+        self._peak_rms = 0.0
+        self._peak_bands = [0.0] * 10
         if self._stream is not None:
             try:
                 self._stream.stop()
+            except Exception as exc:
+                print(f"[{config.APP_NAME}] Warning stopping audio stream: {exc}", flush=True)
+                try:
+                    self._stream.abort()
+                except Exception:
+                    pass
+            try:
                 self._stream.close()
             except Exception as exc:
-                print(f"[{config.APP_NAME}] Warning canceling audio stream: {exc}", flush=True)
+                print(f"[{config.APP_NAME}] Warning closing audio stream: {exc}", flush=True)
             finally:
                 self._stream = None
         self._buffer.clear()
@@ -299,13 +354,33 @@ def paste_text(text: str) -> bool:
                 pass
 
 
+def is_target_hotkey(key: keyboard.Key | keyboard.KeyCode | None) -> bool:
+    """Return True if the pressed key matches the configured hotkey.
+
+    Handles special macOS keycodes:
+    - cmd_r: Key.cmd_r or virtual keycode 54 (Right Command).
+    - f5: Key.f5 or virtual keycodes 96 (standard F5) and 176 (Apple Silicon Mic key).
+    """
+    if key is None:
+        return False
+
+    if config.HOTKEY == "cmd_r":
+        return key == keyboard.Key.cmd_r or getattr(key, "vk", None) == 54
+
+    if config.HOTKEY == "f5":
+        return key == keyboard.Key.f5 or getattr(key, "vk", None) in (96, 176)
+
+    target = getattr(keyboard.Key, config.HOTKEY, None)
+    return key == target if target is not None else False
+
+
 def get_hotkey() -> keyboard.Key:
     """Resolve the configured hotkey string to a pynput keyboard.Key enum value."""
     hotkey = getattr(keyboard.Key, config.HOTKEY, None)
     if hotkey is None:
         raise ValueError(
             f"Invalid hotkey '{config.HOTKEY}' specified in config.py. "
-            f"Expected a valid attribute of pynput.keyboard.Key (e.g. 'alt_r', 'ctrl_r')."
+            f"Expected a valid attribute of pynput.keyboard.Key (e.g. 'f5', 'alt_r', 'ctrl_r')."
         )
     return hotkey
 
@@ -348,6 +423,11 @@ class DictationApp:
         self._listener: keyboard.Listener | None = None
         self._last_hotkey_press_time: float = 0.0
 
+        # Double-tap tracking state
+        self._last_tap_time: float = 0.0
+        self._other_key_pressed: bool = False
+        self._hotkey_held: bool = False
+
     def start(self) -> None:
         """Show overlay, start global keyboard listener, and warm up model in background."""
         self.overlay.show()
@@ -365,7 +445,7 @@ class DictationApp:
             with self._lock:
                 self.is_ready = True
             print(
-                f"[{config.APP_NAME}] Ready. Press Right Option or click pill to talk (Ctrl+C to quit).",
+                f"[{config.APP_NAME}] Ready. Double-tap Right Command or click pill to talk (Ctrl+C to quit).",
                 flush=True,
             )
 
@@ -405,6 +485,7 @@ class DictationApp:
             return
 
         self._level_timer.stop()
+        self.overlay.set_audio_bands([0.0] * 10)
         self.overlay.set_audio_level(0.0)
 
         audio = self.recorder.stop()
@@ -431,6 +512,7 @@ class DictationApp:
     def cancel_dictation(self) -> None:
         """Cancel recording immediately and return to IDLE without transcribing."""
         self._level_timer.stop()
+        self.overlay.set_audio_bands([0.0] * 10)
         self.overlay.set_audio_level(0.0)
         self.recorder.cancel()
         self._current_state = PillState.IDLE
@@ -439,28 +521,41 @@ class DictationApp:
         print(f"[{config.APP_NAME}] Ready.", flush=True)
 
     def _poll_audio_level(self) -> None:
-        """Polled on Qt main thread every 33 ms while recording to update UI state and waveform."""
+        """Polled on Qt main thread every 33 ms while recording to update UI state and vocal waveform."""
         if not self.recorder.is_recording:
             return
 
-        rms = self.recorder.latest_rms
+        rms, raw_bands = self.recorder.consume_audio_levels()
 
         # Transition from LISTENING to SPEAKING once microphone volume exceeds threshold
         if self._current_state == PillState.LISTENING and rms >= config.SPEECH_THRESHOLD:
             self._current_state = PillState.SPEAKING
             self.overlay.set_state(PillState.SPEAKING)
 
-        # Modulate waveform bar heights with live mic amplitude using noise gate & nonlinear curve
+        # Modulate 10-bar waveform with calibrated MacBook Air mic sensitivity
         if self._current_state in (PillState.LISTENING, PillState.SPEAKING):
-            noise_floor = config.SPEECH_THRESHOLD * 0.5
-            if rms <= noise_floor:
-                level = 0.0
+            NOISE_FLOOR = 0.002
+            PEAK_SPEECH = 0.035
+
+            if rms <= NOISE_FLOOR:
+                scaled_bands = [0.0] * 10
             else:
-                # Map from noise floor to peak speech (approx 0.12 RMS)
-                raw_norm = min(1.0, (rms - noise_floor) / max(1e-5, (0.12 - noise_floor)))
-                # Perceptual power curve (gamma ~0.7) for responsive visual feedback
-                level = raw_norm ** 0.7
-            self.overlay.set_audio_level(level)
+                raw_norm = min(1.0, max(0.0, (rms - NOISE_FLOOR) / (PEAK_SPEECH - NOISE_FLOOR)))
+                speech_level = raw_norm ** 0.6
+
+                max_band = max(raw_bands) if raw_bands else 0.0
+                if max_band > 1e-6:
+                    # Spectral equalization tilt across speech frequencies (formants to sibilance)
+                    tilt = [0.9, 0.95, 1.0, 1.05, 1.15, 1.25, 1.35, 1.45, 1.55, 1.65]
+                    scaled_bands = []
+                    for i, b in enumerate(raw_bands):
+                        norm_b = min(1.0, (b / max_band) * tilt[i])
+                        band_val = speech_level * (0.35 + 0.65 * norm_b)
+                        scaled_bands.append(min(1.0, max(0.0, band_val)))
+                else:
+                    scaled_bands = [speech_level] * 10
+
+            self.overlay.set_audio_bands(scaled_bands)
 
     def process_audio(self, audio: np.ndarray) -> None:
         """Transcribe audio on worker thread, apply corrections, and paste text at cursor."""
@@ -490,27 +585,45 @@ class DictationApp:
     # -------------------------------------------------------------------------
 
     def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        """Handle Right Option key press with debounce and bridge to Qt main thread."""
-        if key != self.target_hotkey:
+        """Handle key press event from pynput listener."""
+        is_hotkey = is_target_hotkey(key)
+
+        if not is_hotkey:
+            # If any other key is pressed (e.g. 'c' in Cmd+C), invalidate double-tap
+            self._other_key_pressed = True
+            self._last_tap_time = 0.0
             return
 
-        now = time.monotonic()
-        if now - self._last_hotkey_press_time < config.HOTKEY_DEBOUNCE_SECONDS:
-            return
-        self._last_hotkey_press_time = now
+        # Target hotkey pressed
+        if not self._hotkey_held:
+            # Fresh press (not repeat while holding)
+            self._hotkey_held = True
+            self._other_key_pressed = False
 
-        # Emit signal to dispatch handler onto Qt GUI main thread safely
-        self.ui_bridge.hotkey_toggled.emit()
+        if config.HOTKEY_MODE == "toggle":
+            now = time.monotonic()
+            if now - self._last_hotkey_press_time >= config.HOTKEY_DEBOUNCE_SECONDS:
+                self._last_hotkey_press_time = now
+                self.ui_bridge.hotkey_toggled.emit()
 
     def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        """Handle Right Option key release."""
-        if config.HOTKEY_MODE == "toggle":
-            # In toggle mode, releasing the key does not stop dictation
+        """Handle key release event from pynput listener."""
+        is_hotkey = is_target_hotkey(key)
+        if not is_hotkey:
             return
 
-        if key != self.target_hotkey:
-            return
-        self.ui_bridge.hotkey_toggled.emit()
+        self._hotkey_held = False
+
+        if config.HOTKEY_MODE == "double_tap":
+            if not self._other_key_pressed:
+                now = time.monotonic()
+                if now - self._last_tap_time <= config.DOUBLE_TAP_WINDOW:
+                    self._last_tap_time = 0.0
+                    self.ui_bridge.hotkey_toggled.emit()
+                else:
+                    self._last_tap_time = now
+        elif config.HOTKEY_MODE == "hold":
+            self.ui_bridge.hotkey_toggled.emit()
 
     # -------------------------------------------------------------------------
     # Shutdown
@@ -520,6 +633,7 @@ class DictationApp:
         """Clean up audio, listener, and overlay, then exit the application."""
         print(f"\n[{config.APP_NAME}] Exiting cleanly...", flush=True)
         self._level_timer.stop()
+        self.overlay.set_audio_bands([0.0] * 10)
         if self.recorder.is_recording:
             self.recorder.cancel()
         if self._listener is not None and self._listener.is_alive():
