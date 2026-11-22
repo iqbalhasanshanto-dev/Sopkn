@@ -1,42 +1,56 @@
 """
 Spokn - Personal Offline Dictation for Apple Silicon
 
-High-Level V1 Flow:
-1. Startup & Warm-Up:
-   - Load configuration and warm up the local MLX Whisper model in memory.
-2. Hold-to-Talk Hotkey Listener:
-   - Press and hold Right Option (HOTKEY) to begin recording audio from the microphone.
-   - Stream audio chunks into an in-memory buffer.
-3. Release & Transcribe:
-   - Releasing the key stops recording.
-   - If duration >= MIN_RECORDING_DURATION, pass the buffer to the local MLX Whisper model.
-4. Paste & Restore:
-   - Back up current clipboard content using pbpaste.
-   - Copy transcribed text to the clipboard using pbcopy and simulate Cmd+V via osascript.
-   - After CLIPBOARD_RESTORE_DELAY, restore the previous clipboard content.
+Architecture & V1 Flow:
+1. UI Initialization & Model Warm-Up:
+   - Initialize PySide6 QApplication and display the DictationPillOverlay in IDLE state.
+   - Run MLX Whisper warm-up asynchronously in a background thread so the UI appears instantly.
+2. Dual Trigger Dictation (Hold-to-Talk or Click-to-Toggle):
+   - Hold Right Option (HOTKEY) or click the IDLE pill to start microphone recording (LISTENING).
+   - Once microphone RMS exceeds SPEECH_THRESHOLD, transition to SPEAKING with live waveform modulation.
+3. Release or Stop:
+   - Releasing the hotkey or clicking Stop transitions to COLLAPSING -> PROCESSING.
+   - Clicking × Cancel at any time cancels recording and resets directly to IDLE.
+4. Local Inference & Paste:
+   - In-memory float32 audio is transcribed with mlx-whisper (conditioned on language & vocabulary hints).
+   - Copies transcript to clipboard, simulates Cmd+V via osascript, and restores prior clipboard.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import signal
 import subprocess
+import sys
 import threading
 import time
 import numpy as np
 from pynput import keyboard
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtWidgets import QApplication
 import sounddevice as sd
 import mlx_whisper
 
 import config
+from overlay import DictationPillOverlay, PillState
+
+
+class UiBridge(QObject):
+    """Thread-safe signal bridge communicating between background threads and the Qt UI."""
+
+    state_changed = Signal(object)  # PillState
+    audio_level = Signal(float)     # float (0.0 to 1.0)
 
 
 class AudioRecorder:
     """Handles real-time microphone audio capture and normalization using sounddevice."""
 
-    def __init__(self) -> None:
+    def __init__(self, level_callback: Callable[[float], None] | None = None) -> None:
         """Initializes internal audio chunk buffer, recording flag, and stream handle."""
         self._buffer: list[np.ndarray] = []
         self._is_recording: bool = False
         self._stream: sd.InputStream | None = None
+        self._level_callback = level_callback
 
     @property
     def is_recording(self) -> bool:
@@ -50,11 +64,7 @@ class AudioRecorder:
         time_info: dict,
         status: sd.CallbackFlags,
     ) -> None:
-        """Callback invoked by PortAudio on a dedicated audio thread for each block.
-
-        Appends a copy of indata to the buffer while recording. Logs any stream
-        status warnings (such as buffer overflow or underflow).
-        """
+        """Callback invoked by PortAudio on a dedicated audio thread for each block."""
         if status:
             print(f"[{config.APP_NAME}] Audio stream warning: {status}", flush=True)
 
@@ -62,6 +72,12 @@ class AudioRecorder:
             # indata is a view managed by sounddevice and gets overwritten;
             # store an explicit copy of each chunk.
             self._buffer.append(indata.copy())
+
+            if self._level_callback is not None:
+                # Compute normalized RMS amplitude (0.0 to 1.0) from int16 audio
+                data_float = indata.astype(np.float32) / 32768.0
+                rms = float(np.sqrt(np.mean(data_float ** 2)))
+                self._level_callback(rms)
 
     def start(self) -> bool:
         """Reset buffer and open/start the sounddevice InputStream.
@@ -128,12 +144,22 @@ class AudioRecorder:
             # Reject recordings that are too short to avoid false triggers
             return None
 
-        # Why normalize int16 to float32:
-        # Whisper expects 32-bit floating point audio waveform samples normalized
-        # to the [-1.0, 1.0] range. Dividing standard signed 16-bit integer PCM values
-        # (-32768 to 32767) by 32768.0 converts to float32 without clipping or loss.
+        # Normalize int16 PCM to float32 in range [-1.0, 1.0]
         audio_float32 = audio_int16.astype(np.float32) / 32768.0
         return audio_float32
+
+    def cancel(self) -> None:
+        """Stop and close the audio stream, discarding captured chunks without returning audio."""
+        self._is_recording = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception as exc:
+                print(f"[{config.APP_NAME}] Warning canceling audio stream: {exc}", flush=True)
+            finally:
+                self._stream = None
+        self._buffer.clear()
 
 
 class Transcriber:
@@ -144,22 +170,17 @@ class Transcriber:
         self.model_repo = model_repo
 
     def warm_up(self) -> None:
-        """Warm up the MLX model and Apple Silicon unified memory before live dictation.
-
-        Why run a silent warm-up at startup:
-        1. Model Weights & Compilation: On first launch, huggingface_hub downloads
-           the model weights if not already cached. MLX then compiles computation
-           graphs and loads the neural weights into unified memory.
-        2. Eliminates Cold-Start Latency Spike: The initial inference call typically
-           incurs a 1-3 second warm-up delay. By passing a 1-second silent audio buffer
-           at application startup, the very first user dictation transcribes with
-           instant, responsive latency.
-        """
+        """Warm up the MLX model and Apple Silicon unified memory before live dictation."""
         print(f"[{config.APP_NAME}] Loading model ({self.model_repo})...", flush=True)
         try:
             # 1 second of silent float32 audio at 16kHz
             silent_audio = np.zeros(config.SAMPLE_RATE, dtype=np.float32)
-            mlx_whisper.transcribe(silent_audio, path_or_hf_repo=self.model_repo)
+            mlx_whisper.transcribe(
+                silent_audio,
+                path_or_hf_repo=self.model_repo,
+                language=config.LANGUAGE,
+                initial_prompt=config.INITIAL_PROMPT,
+            )
             print(f"[{config.APP_NAME}] Model ready.", flush=True)
         except Exception as exc:
             print(
@@ -168,20 +189,14 @@ class Transcriber:
             )
 
     def transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe a normalized 1D float32 numpy audio buffer to text.
-
-        Why passing float32 numpy array directly avoids disk I/O:
-        Traditional transcription wrappers write audio chunks to temporary .wav files
-        on disk, which introduces file system I/O latency, locks, and SSD write wear.
-        mlx-whisper accepts an in-memory 1D float32 numpy array directly. Audio flows
-        seamlessly from microphone memory buffers straight into Apple Silicon Metal/GPU
-        unified memory with zero disk round-trips.
-
-        Returns:
-            str: Stripped transcribed text, or empty string on error or no speech.
-        """
+        """Transcribe a normalized 1D float32 numpy audio buffer to text with language & vocabulary hints."""
         try:
-            result = mlx_whisper.transcribe(audio, path_or_hf_repo=self.model_repo)
+            result = mlx_whisper.transcribe(
+                audio,
+                path_or_hf_repo=self.model_repo,
+                language=config.LANGUAGE,
+                initial_prompt=config.INITIAL_PROMPT,
+            )
             return result.get("text", "").strip()
         except Exception as exc:
             print(
@@ -192,11 +207,7 @@ class Transcriber:
 
 
 def get_clipboard() -> str | None:
-    """Read the current text content from the macOS system clipboard using pbpaste.
-
-    Returns:
-        str | None: Clipboard string content on success, or None on failure.
-    """
+    """Read the current text content from the macOS system clipboard using pbpaste."""
     try:
         result = subprocess.run(
             ["pbpaste"],
@@ -212,11 +223,7 @@ def get_clipboard() -> str | None:
 
 
 def set_clipboard(text: str) -> None:
-    """Write text to the macOS system clipboard using pbcopy.
-
-    Args:
-        text: The string to place onto the clipboard.
-    """
+    """Write text to the macOS system clipboard using pbcopy."""
     subprocess.run(
         ["pbcopy"],
         input=text,
@@ -226,27 +233,7 @@ def set_clipboard(text: str) -> None:
 
 
 def paste_text(text: str) -> bool:
-    """Copy text to clipboard, simulate Cmd+V via osascript, and restore prior clipboard.
-
-    Why wait CLIPBOARD_RESTORE_DELAY before restoring:
-    Target macOS applications (Electron, browsers, terminals, text editors) process
-    simulated Cmd+V asynchronously from their respective OS run-loops. If pbcopy
-    restores the old clipboard content too quickly (e.g. immediately after keystroke),
-    the target application might paste the previously restored clipboard content
-    instead of the transcribed text. A short pause (config.CLIPBOARD_RESTORE_DELAY)
-    guarantees the active application has consumed the transcribed text before
-    the original clipboard is restored.
-
-    Why paste errors are caught:
-    Simulating keystrokes via AppleScript requires macOS Accessibility permissions
-    (System Settings -> Privacy & Security -> Accessibility). If permissions are
-    missing, revoked, or an OS error occurs, catching the exception ensures the
-    background thread logs a clean diagnostic warning and DictationApp returns
-    gracefully to Ready state without crashing the global hotkey listener.
-
-    Returns:
-        bool: True if paste succeeded, False otherwise.
-    """
+    """Copy text to clipboard, simulate Cmd+V via osascript, and restore prior clipboard."""
     previous_clipboard = get_clipboard()
     try:
         set_clipboard(text)
@@ -279,14 +266,7 @@ def paste_text(text: str) -> bool:
 
 
 def get_hotkey() -> keyboard.Key:
-    """Resolve the configured hotkey string to a pynput keyboard.Key enum value.
-
-    Returns:
-        keyboard.Key: The resolved pynput Key enum attribute.
-
-    Raises:
-        ValueError: If config.HOTKEY is not a valid attribute on keyboard.Key.
-    """
+    """Resolve the configured hotkey string to a pynput keyboard.Key enum value."""
     hotkey = getattr(keyboard.Key, config.HOTKEY, None)
     if hotkey is None:
         raise ValueError(
@@ -297,68 +277,98 @@ def get_hotkey() -> keyboard.Key:
 
 
 class DictationApp:
-    """Coordinates hold-to-talk hotkey events, audio recording, and background processing.
-
-    macOS Permissions & Architecture Notes:
-    - Accessibility Permission: pynput monitors global key events via macOS Quartz
-      event taps (CGEventTap), and osascript simulates Cmd+V keystrokes. Terminal
-      apps must be granted Accessibility permissions under System Settings ->
-      Privacy & Security -> Accessibility.
-    - Key-Repeat Protection: When a physical key is held down, macOS fires repeated
-      key-press events at the OS key-repeat rate. Guarding with `not recorder.is_recording`
-      and `not is_processing` prevents key-repeat events from restarting or corrupting
-      the recording while the user is simply holding down the key.
-    - Asynchronous Processing: Heavy processing and MLX Whisper inference run on a
-      background daemon thread (`process_audio`). This ensures the pynput listener
-      event loop is never blocked, keeping hotkey detection immediate and fluid.
-    """
+    """Coordinates the Dictation Pill UI, global hotkey listener, and audio transcription."""
 
     def __init__(
         self,
-        recorder: AudioRecorder | None = None,
+        overlay: DictationPillOverlay | None = None,
         transcriber: Transcriber | None = None,
     ) -> None:
-        self.recorder = recorder or AudioRecorder()
+        self.overlay = overlay or DictationPillOverlay()
         self.transcriber = transcriber or Transcriber()
         self.target_hotkey = get_hotkey()
+
+        # Thread-safe Qt signal bridge
+        self.ui_bridge = UiBridge()
+        self.ui_bridge.state_changed.connect(self.overlay.set_state)
+        self.ui_bridge.audio_level.connect(self.overlay.set_audio_level)
+
+        # Connect overlay interactive mouse events
+        self.overlay.idle_clicked.connect(self.on_overlay_idle_clicked)
+        self.overlay.cancel_clicked.connect(self.on_overlay_cancel_clicked)
+        self.overlay.stop_clicked.connect(self.on_overlay_stop_clicked)
+
+        # Audio recorder with live RMS volume callback
+        self.recorder = AudioRecorder(level_callback=self._on_audio_chunk)
+
+        # State tracking
+        self.is_ready = False
         self.is_processing = False
+        self._current_state = PillState.IDLE
         self._lock = threading.Lock()
         self._listener: keyboard.Listener | None = None
 
-    def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        """Handle hotkey press to start audio recording.
+    def start(self) -> None:
+        """Show overlay, start global keyboard listener, and warm up model in background."""
+        self.overlay.show()
 
-        Filters out key-repeat events and checks that no other transcription
-        job is actively processing.
-        """
-        if key != self.target_hotkey:
-            return
+        # Start pynput global keyboard listener in background thread
+        self._listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+        )
+        self._listener.start()
 
+        # Run model warm-up in a background thread so the UI is immediately visible
+        def _warmup_worker() -> None:
+            self.transcriber.warm_up()
+            with self._lock:
+                self.is_ready = True
+            print(
+                f"[{config.APP_NAME}] Ready. Hold Right Option or click pill to talk (Ctrl+C to quit).",
+                flush=True,
+            )
+
+        warmup_thread = threading.Thread(
+            target=_warmup_worker,
+            daemon=True,
+            name="ModelWarmupThread",
+        )
+        warmup_thread.start()
+
+    # -------------------------------------------------------------------------
+    # Dictation Control Logic
+    # -------------------------------------------------------------------------
+
+    def start_dictation(self) -> None:
+        """Start audio recording and transition UI to LISTENING state."""
         with self._lock:
-            # Prevent re-triggering while already recording (key-repeat) or processing
-            if self.recorder.is_recording or self.is_processing:
+            if not self.is_ready or self.recorder.is_recording or self.is_processing:
                 return
 
         if self.recorder.start():
+            self._current_state = PillState.LISTENING
+            self.ui_bridge.state_changed.emit(PillState.LISTENING)
             print(f"[{config.APP_NAME}] Listening...", flush=True)
 
-    def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        """Handle hotkey release to stop audio recording and dispatch processing."""
-        if key != self.target_hotkey:
-            return
-
+    def stop_dictation(self) -> None:
+        """Stop recording, trigger COLLAPSING -> PROCESSING, and transcribe."""
         if not self.recorder.is_recording:
             return
 
         audio = self.recorder.stop()
         if audio is None:
+            self._current_state = PillState.IDLE
+            self.ui_bridge.state_changed.emit(PillState.IDLE)
             print(f"[{config.APP_NAME}] Ignored short recording.", flush=True)
             print(f"[{config.APP_NAME}] Ready.", flush=True)
             return
 
+        # Transition to COLLAPSING (which auto-morphs to PROCESSING after 220 ms)
+        self._current_state = PillState.PROCESSING
+        self.ui_bridge.state_changed.emit(PillState.COLLAPSING)
         print(f"[{config.APP_NAME}] Transcribing...", flush=True)
 
-        # Dispatch audio processing off the pynput listener thread
         worker = threading.Thread(
             target=self.process_audio,
             args=(audio,),
@@ -367,12 +377,31 @@ class DictationApp:
         )
         worker.start()
 
-    def process_audio(self, audio: np.ndarray) -> None:
-        """Process captured audio on a background worker thread.
+    def cancel_dictation(self) -> None:
+        """Cancel recording immediately and return to IDLE without transcribing."""
+        self.recorder.cancel()
+        self._current_state = PillState.IDLE
+        self.ui_bridge.state_changed.emit(PillState.IDLE)
+        print(f"[{config.APP_NAME}] Dictation canceled.", flush=True)
+        print(f"[{config.APP_NAME}] Ready.", flush=True)
 
-        Transcribes the normalized float32 buffer with mlx-whisper, prints
-        the resulting text, and simulates Cmd+V paste at the active cursor.
-        """
+    def _on_audio_chunk(self, rms: float) -> None:
+        """Process live audio volume: switch to SPEAKING on speech, and modulate bars."""
+        if not self.recorder.is_recording:
+            return
+
+        # If in LISTENING and volume crosses speech threshold, morph to SPEAKING
+        if self._current_state == PillState.LISTENING and rms >= config.SPEECH_THRESHOLD:
+            self._current_state = PillState.SPEAKING
+            self.ui_bridge.state_changed.emit(PillState.SPEAKING)
+
+        # Modulate waveform bar heights with live mic amplitude
+        if self._current_state == PillState.SPEAKING:
+            level = min(1.0, rms * 10.0)
+            self.ui_bridge.audio_level.emit(level)
+
+    def process_audio(self, audio: np.ndarray) -> None:
+        """Transcribe audio on worker thread and paste text at cursor."""
         with self._lock:
             self.is_processing = True
 
@@ -386,46 +415,71 @@ class DictationApp:
         finally:
             with self._lock:
                 self.is_processing = False
+                self._current_state = PillState.IDLE
+            self.ui_bridge.state_changed.emit(PillState.IDLE)
             print(f"[{config.APP_NAME}] Ready.", flush=True)
 
-    def run(self) -> None:
-        """Start the keyboard listener and wait for events until interrupted."""
-        self.transcriber.warm_up()
-        print(
-            f"[{config.APP_NAME}] Ready. Hold Right Option to talk (Ctrl+C to quit).",
-            flush=True,
-        )
+    # -------------------------------------------------------------------------
+    # Hotkey Event Callbacks
+    # -------------------------------------------------------------------------
 
-        with keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release,
-        ) as listener:
-            self._listener = listener
-            try:
-                # Use bounded join loop so KeyboardInterrupt (SIGINT) is caught immediately
-                while listener.is_alive():
-                    listener.join(0.5)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                self.stop()
+    def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        """Handle Right Option key press (filtered for key-repeat)."""
+        if key != self.target_hotkey:
+            return
+        self.start_dictation()
 
-    def stop(self) -> None:
-        """Safely clean up active recording and stop listener on shutdown."""
+    def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        """Handle Right Option key release."""
+        if key != self.target_hotkey:
+            return
+        self.stop_dictation()
+
+    # -------------------------------------------------------------------------
+    # Overlay Mouse Event Callbacks
+    # -------------------------------------------------------------------------
+
+    def on_overlay_idle_clicked(self) -> None:
+        """Start dictation when the resting IDLE pill is clicked."""
+        self.start_dictation()
+
+    def on_overlay_stop_clicked(self) -> None:
+        """Stop dictation and transcribe when the red Stop button is clicked."""
+        self.stop_dictation()
+
+    def on_overlay_cancel_clicked(self) -> None:
+        """Discard audio when the × Cancel button is clicked."""
+        self.cancel_dictation()
+
+    # -------------------------------------------------------------------------
+    # Shutdown
+    # -------------------------------------------------------------------------
+
+    def stop_and_exit(self, app: QApplication) -> None:
+        """Clean up audio, listener, and overlay, then exit the application."""
+        print(f"\n[{config.APP_NAME}] Exiting cleanly...", flush=True)
         if self.recorder.is_recording:
-            self.recorder.stop()
+            self.recorder.cancel()
         if self._listener is not None and self._listener.is_alive():
             self._listener.stop()
-        print(f"\n[{config.APP_NAME}] Exiting...", flush=True)
+        self.overlay.close()
+        app.quit()
 
 
 def main() -> None:
     """Entry point for Spokn."""
-    app = DictationApp()
-    try:
-        app.run()
-    except KeyboardInterrupt:
-        app.stop()
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    # Heartbeat timer so Python signal handlers can execute inside Qt event loop
+    heartbeat_timer = QTimer()
+    heartbeat_timer.timeout.connect(lambda: None)
+    heartbeat_timer.start(200)
+
+    dictation_app = DictationApp()
+    signal.signal(signal.SIGINT, lambda *_: dictation_app.stop_and_exit(app))
+
+    dictation_app.start()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

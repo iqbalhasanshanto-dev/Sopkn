@@ -1,16 +1,23 @@
 """
 Spokn - Central Configuration
 All configurable parameters for audio recording, MLX Whisper transcription,
-hotkey bindings, and clipboard injection are defined here.
+hotkey bindings, visual overlay, and clipboard injection are defined here.
 """
 
 # Application identity
 APP_NAME = "Spokn"
 
 # Model repository on Hugging Face / MLX
-# Default: Fast, lightweight English model with low memory footprint and latency.
-# Optional upgrade: "mlx-community/whisper-large-v3-turbo" (multilingual, higher accuracy)
-MODEL_REPO = "mlx-community/whisper-small.en-mlx"
+# Default: High-accuracy multilingual model optimized for Apple Silicon unified memory.
+MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+# Optional lighter/faster fallback: "mlx-community/whisper-small.en-mlx"
+
+# Language and prompt context
+# Lock Whisper to English to prevent hallucinations or language drifting on regional accents
+LANGUAGE = "en"
+
+# Custom vocabulary hint to condition Whisper's tokenizer on domain-specific proper nouns
+INITIAL_PROMPT = "Spokn, VUPC, Codeforces, ESP32, PySide6, Antigravity, macOS, Rajshahi"
 
 # Global hotkey configuration
 # Key to hold down to record and release to transcribe.
@@ -22,6 +29,10 @@ HOTKEY = "alt_r"
 SAMPLE_RATE = 16000  # 16kHz sample rate
 CHANNELS = 1         # Mono audio
 DTYPE = "int16"      # Standard 16-bit PCM integer format
+
+# Speech detection threshold
+# Normalized RMS volume threshold (0.0 to 1.0) to transition the pill from LISTENING to SPEAKING
+SPEECH_THRESHOLD = 0.015
 
 # Recording thresholds
 # Minimum recording duration in seconds; ignore shorter keypresses to prevent accidental triggers.

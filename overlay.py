@@ -12,6 +12,7 @@ Exact implementation of the macOS Dictation Pill design from Figma:
 from __future__ import annotations
 
 from enum import Enum
+import signal
 import sys
 from typing import List
 
@@ -50,10 +51,11 @@ class DictationPillOverlay(QWidget):
 
     Window Behavior:
     - Uses Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
-      and Qt.WA_ShowWithoutActivating so the overlay never steals input focus or cursor
-      active state from the target application where the user is typing.
+      | Qt.NoDropShadowWindowHint and Qt.WA_ShowWithoutActivating so the overlay never steals
+      input focus or cursor active state from the target application where the user is typing,
+      and macOS does not draw an unwanted default window drop-shadow box.
     - Uses Qt.WA_TranslucentBackground with custom QPainter rendering so the capsule,
-      border stroke, and 16 px drop shadow blend natively over macOS desktop wallpaper.
+      border stroke, and soft elevation shadow blend natively over macOS desktop wallpaper.
     """
 
     # Interactive signals
@@ -62,7 +64,7 @@ class DictationPillOverlay(QWidget):
     stop_clicked = Signal()
 
     # Figma Geometry Tokens
-    PADDING = 28.0            # Canvas padding so 16 px blur drop shadow never clips
+    PADDING = 28.0            # Canvas padding so soft drop shadow never clips
     BOTTOM_INSET = 12.0       # Distance from bottom of screen to bottom edge of pill
 
     # Exact state dimensions (width, height)
@@ -92,12 +94,13 @@ class DictationPillOverlay(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        # macOS Focus-Safe & Translucent Window Setup
+        # macOS Focus-Safe, Shadow-Safe & Translucent Window Setup
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint
             | Qt.FramelessWindowHint
             | Qt.Tool
             | Qt.WindowDoesNotAcceptFocus
+            | Qt.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
@@ -237,7 +240,7 @@ class DictationPillOverlay(QWidget):
         pill_rect = QRectF(self.PADDING, self.PADDING, self._current_w, self._current_h)
         corner_radius = self._current_h / 2.0
 
-        # 1. Drop shadow: 0px 4px 16px rgba(0,0,0,0.35) in active states; none in idle
+        # 1. Drop shadow: subtle 0px 3px 12px rgba(0,0,0,0.20) in active states; none in idle
         if self._state != PillState.IDLE:
             self._paint_shadow(painter, pill_rect, corner_radius)
 
@@ -267,18 +270,19 @@ class DictationPillOverlay(QWidget):
             self._paint_processing_contents(painter, pill_rect)
 
     def _paint_shadow(self, painter: QPainter, pill_rect: QRectF, radius: float) -> None:
-        """Paint multi-pass soft drop shadow (0px 4px 16px rgba(0, 0, 0, 0.35))."""
+        """Paint soft, low-alpha elevation shadow without visible outer ring artifacts."""
         painter.save()
         painter.setPen(Qt.NoPen)
-        blur_steps = 14
-        dy = 4.0
+        blur_steps = 8
+        dy = 3.0
         for i in range(blur_steps, 0, -1):
             progress = i / blur_steps
-            alpha = int(255 * 0.35 * (1.0 - progress) ** 1.8 / blur_steps * 3.8)
+            # Max alpha ~20% with smooth quadratic falloff
+            alpha = int(255 * 0.20 * (1.0 - progress) ** 2 / blur_steps * 2.8)
             if alpha <= 0:
                 continue
             painter.setBrush(QColor(0, 0, 0, alpha))
-            spread = float(i)
+            spread = float(i) * 0.85
             shadow_rect = pill_rect.adjusted(-spread, -spread + dy, spread, spread + dy)
             painter.drawRoundedRect(shadow_rect, radius + spread, radius + spread)
         painter.restore()
@@ -317,18 +321,21 @@ class DictationPillOverlay(QWidget):
         self._paint_stop_button(painter, stop_center, size=4.0, opacity=0.25)
 
     def _paint_processing_contents(self, painter: QPainter, pill_rect: QRectF) -> None:
-        """Render flat waveform on left + 3 pulsing dots on right in 90 × 26 px capsule."""
+        """Render flat waveform and 3 pulsing dots centered in 90 × 26 px capsule.
+
+        Combined group width: 47 px (waveform) + 7 px (gap) + 18 px (3 dots) = 72 px.
+        Centering horizontally leaves exactly (90 - 72) / 2 = 9 px margin on both sides.
+        """
         cy = pill_rect.center().y()
+        start_x = pill_rect.center().x() - 36.0
 
-        # Left: flat 10-bar waveform (47 px width, left inset 8 px)
-        wave_left = pill_rect.left() + 8.0
-        self._paint_waveform(painter, wave_left, cy, is_active=False)
+        # Left: flat 10-bar waveform (47 px width)
+        self._paint_waveform(painter, start_x, cy, is_active=False)
 
-        # Right: 3 sequential pulsing dots (total 20 × 4 px, right inset 8 px)
-        # Dot centers at x = 64, 72, 80 relative to pill_rect
-        dots_left = pill_rect.left() + 8.0 + 47.0 + 7.0
+        # Right: 3 sequential pulsing dots (total 18 px span: 3 dots of 4 px with 3 px gaps)
+        dots_start_x = start_x + 47.0 + 7.0
         for i in range(3):
-            dot_center = QPointF(dots_left + 2.0 + i * 8.0, cy)
+            dot_center = QPointF(dots_start_x + 2.0 + i * 7.0, cy)
             is_active = (i == self._processing_phase)
             color = self.COLOR_WHITE if is_active else self.COLOR_DOT_INACTIVE
             painter.setPen(Qt.NoPen)
@@ -452,6 +459,9 @@ def main() -> None:
     overlay = DictationPillOverlay()
     overlay.show()
 
+    # Clean exit on Ctrl+C in terminal
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+
     # Sequence of states to cycle through
     sequence = [
         (PillState.IDLE, 2000, "1/5: IDLE (36 × 6 px)"),
@@ -479,7 +489,7 @@ def main() -> None:
     # Start first step
     QTimer.singleShot(500, step)
 
-    # Allow clean exit with Ctrl+C
+    # Heartbeat timer so Python SIGINT can be handled by Qt event loop
     sigint_timer = QTimer()
     sigint_timer.timeout.connect(lambda: None)
     sigint_timer.start(200)
