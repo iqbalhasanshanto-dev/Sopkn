@@ -18,8 +18,10 @@ High-Level V1 Flow:
 
 from __future__ import annotations
 
+import threading
 import time
 import numpy as np
+from pynput import keyboard
 import sounddevice as sd
 
 import config
@@ -132,29 +134,148 @@ class AudioRecorder:
         return audio_float32
 
 
+def get_hotkey() -> keyboard.Key:
+    """Resolve the configured hotkey string to a pynput keyboard.Key enum value.
+
+    Returns:
+        keyboard.Key: The resolved pynput Key enum attribute.
+
+    Raises:
+        ValueError: If config.HOTKEY is not a valid attribute on keyboard.Key.
+    """
+    hotkey = getattr(keyboard.Key, config.HOTKEY, None)
+    if hotkey is None:
+        raise ValueError(
+            f"Invalid hotkey '{config.HOTKEY}' specified in config.py. "
+            f"Expected a valid attribute of pynput.keyboard.Key (e.g. 'alt_r', 'ctrl_r')."
+        )
+    return hotkey
+
+
+class DictationApp:
+    """Coordinates hold-to-talk hotkey events, audio recording, and background processing.
+
+    macOS Permissions & Architecture Notes:
+    - Accessibility Permission: pynput monitors global key events via macOS Quartz
+      event taps (CGEventTap). Terminal apps must be granted Accessibility permissions
+      under System Settings -> Privacy & Security -> Accessibility.
+    - Key-Repeat Protection: When a physical key is held down, macOS fires repeated
+      key-press events at the OS key-repeat rate. Guarding with `not recorder.is_recording`
+      and `not is_processing` prevents key-repeat events from restarting or corrupting
+      the recording while the user is simply holding down the key.
+    - Asynchronous Processing: Heavy processing (and later, Whisper inference) runs
+      on a background daemon thread (`process_audio`). This ensures the pynput listener
+      event loop is never blocked, keeping hotkey detection immediate and fluid.
+    """
+
+    def __init__(self, recorder: AudioRecorder | None = None) -> None:
+        self.recorder = recorder or AudioRecorder()
+        self.target_hotkey = get_hotkey()
+        self.is_processing = False
+        self._lock = threading.Lock()
+        self._listener: keyboard.Listener | None = None
+
+    def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        """Handle hotkey press to start audio recording.
+
+        Filters out key-repeat events and checks that no other transcription
+        job is actively processing.
+        """
+        if key != self.target_hotkey:
+            return
+
+        with self._lock:
+            # Prevent re-triggering while already recording (key-repeat) or processing
+            if self.recorder.is_recording or self.is_processing:
+                return
+
+        if self.recorder.start():
+            print(f"[{config.APP_NAME}] Listening...", flush=True)
+
+    def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        """Handle hotkey release to stop audio recording and dispatch processing."""
+        if key != self.target_hotkey:
+            return
+
+        if not self.recorder.is_recording:
+            return
+
+        audio = self.recorder.stop()
+        if audio is None:
+            print(f"[{config.APP_NAME}] Ignored short recording.", flush=True)
+            print(f"[{config.APP_NAME}] Ready.", flush=True)
+            return
+
+        print(f"[{config.APP_NAME}] Transcribing...", flush=True)
+
+        # Dispatch audio processing off the pynput listener thread
+        worker = threading.Thread(
+            target=self.process_audio,
+            args=(audio,),
+            daemon=True,
+            name="AudioProcessorThread",
+        )
+        worker.start()
+
+    def process_audio(self, audio: np.ndarray) -> None:
+        """Process captured audio on a background worker thread (Phase 2.2 stub).
+
+        Marks `is_processing = True` to prevent new recordings while processing,
+        logs the captured audio duration, and resets `is_processing = False` in a
+        finally block before printing Ready.
+        """
+        with self._lock:
+            self.is_processing = True
+
+        try:
+            duration = len(audio) / config.SAMPLE_RATE
+            print(
+                f"[{config.APP_NAME}] Captured {duration:.2f}s of audio "
+                f"(ready for Phase 3 transcription).",
+                flush=True,
+            )
+        finally:
+            with self._lock:
+                self.is_processing = False
+            print(f"[{config.APP_NAME}] Ready.", flush=True)
+
+    def run(self) -> None:
+        """Start the keyboard listener and wait for events until interrupted."""
+        print(
+            f"[{config.APP_NAME}] Ready. Hold Right Option to talk (Ctrl+C to quit).",
+            flush=True,
+        )
+
+        with keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+        ) as listener:
+            self._listener = listener
+            try:
+                # Use bounded join loop so KeyboardInterrupt (SIGINT) is caught immediately
+                while listener.is_alive():
+                    listener.join(0.5)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.stop()
+
+    def stop(self) -> None:
+        """Safely clean up active recording and stop listener on shutdown."""
+        if self.recorder.is_recording:
+            self.recorder.stop()
+        if self._listener is not None and self._listener.is_alive():
+            self._listener.stop()
+        print(f"\n[{config.APP_NAME}] Exiting...", flush=True)
+
+
 def main() -> None:
-    """Temporary self-test verifying microphone capture, portaudio, and permissions."""
-    print(f"{config.APP_NAME} initialized. Ready to wire audio and hotkey modules.")
-    print("Testing microphone capture (2-second self-test recording)...")
-
-    recorder = AudioRecorder()
-    if not recorder.start():
-        print("Microphone self-test failed: could not open audio stream.")
-        return
-
-    print("Recording... Speak into your microphone!")
-    time.sleep(2)
-
-    audio = recorder.stop()
-    if audio is not None:
-        duration = len(audio) / config.SAMPLE_RATE
-        print("Test recording successful!")
-        print(f"  Duration: {duration:.2f}s")
-        print(f"  Shape:    {audio.shape}")
-        print(f"  Dtype:    {audio.dtype}")
-        print(f"  Range:    [{audio.min():.4f}, {audio.max():.4f}]")
-    else:
-        print("No valid audio captured (recording too short or empty).")
+    """Entry point for Spokn."""
+    app = DictationApp()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        app.stop()
 
 
 if __name__ == "__main__":
