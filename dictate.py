@@ -229,8 +229,8 @@ def create_tray_icon() -> QIcon:
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
-    # 2.0 pt padding on each side (= 4 px @2x padding) -> 14.0x14.0 pt content
-    target_rect = QRectF(2.0, 2.0, 14.0, 14.0)
+    # 1.5 pt padding on each side (= 3 px @2x padding) -> 15.0x15.0 pt content
+    target_rect = QRectF(1.5, 1.5, 15.0, 15.0)
     painter.drawImage(target_rect, s_img)
     painter.end()
 
@@ -334,6 +334,7 @@ class AudioRecorder:
                     samplerate=config.SAMPLE_RATE,
                     channels=config.CHANNELS,
                     dtype=config.DTYPE,
+                    blocksize=1024,
                     callback=self._audio_callback,
                 )
                 self._stream.start()
@@ -605,7 +606,7 @@ class DictationApp:
 
         # Minimal macOS Menu-Bar Tray Icon
         self.use_ollama_cleanup: bool = getattr(config, "USE_OLLAMA_CLEANUP", False)
-        self.tray_icon = QSystemTrayIcon(create_tray_icon(), self.overlay)
+        self.tray_icon = QSystemTrayIcon(create_tray_icon(), QApplication.instance())
         self.tray_icon.setToolTip(f"{config.APP_NAME} v{config.APP_VERSION}")
         self.tray_menu = QMenu()
 
@@ -629,7 +630,6 @@ class DictationApp:
         self._quit_action.triggered.connect(lambda: self.stop_and_exit(QApplication.instance()))
 
         self.tray_icon.setContextMenu(self.tray_menu)
-        self.tray_icon.show()
 
         # Context menu on right-clicking the floating pill
         self.overlay.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -704,8 +704,9 @@ class DictationApp:
             self._status_action.setText(f"{config.APP_NAME} v{config.APP_VERSION} — {status}")
 
     def start(self) -> None:
-        """Show overlay, start global keyboard listener, and warm up model in background."""
+        """Show overlay, mount menu bar tray icon, start global keyboard listener, and warm up model in background."""
         self.overlay.show()
+        QTimer.singleShot(150, self.tray_icon.show)
 
         # Check accessibility permissions
         try:
@@ -1023,6 +1024,14 @@ def main() -> None:
     acquire_single_instance_lock()
 
     app = QApplication.instance() or QApplication(sys.argv)
+
+    # Set macOS accessory activation policy immediately before constructing any UI or tray elements
+    try:
+        import AppKit
+        activation_policy_accessory = getattr(AppKit, "NSApplicationActivationPolicyAccessory", 1)
+        AppKit.NSApp.setActivationPolicy_(activation_policy_accessory)
+    except Exception:
+        pass
 
     # Heartbeat timer so Python signal handlers can execute inside Qt event loop
     heartbeat_timer = QTimer()
