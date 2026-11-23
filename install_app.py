@@ -60,8 +60,8 @@ for y in range(img.height()):
             if y > max_y: max_y = y
 crop_w = max_x - min_x + 1
 crop_h = max_y - min_y + 1
-s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
-s_img.fill(Qt.transparent)
+s_img = QImage(crop_w, crop_h, QImage.Format.Format_ARGB32)
+s_img.fill(Qt.GlobalColor.transparent)
 for y in range(crop_h):
     for x in range(crop_w):
         c = QColor(img.pixel(min_x + x, min_y + y))
@@ -69,11 +69,11 @@ for y in range(crop_h):
         if lum > 40:
             alpha = int(min(255, lum))
             s_img.setPixelColor(x, y, QColor(255, 255, 255, alpha))
-canvas = QImage(1024, 1024, QImage.Format_ARGB32)
-canvas.fill(Qt.transparent)
+canvas = QImage(1024, 1024, QImage.Format.Format_ARGB32)
+canvas.fill(Qt.GlobalColor.transparent)
 painter = QPainter(canvas)
-painter.setRenderHint(QPainter.Antialiasing, True)
-painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 squircle_rect = QRectF(92.0, 92.0, 840.0, 840.0)
 pen = QPen(QColor(255, 255, 255, 31), 2.0)
 painter.setPen(pen)
@@ -111,8 +111,8 @@ canvas.save('{output_png_path}')
     crop_w = max_x - min_x + 1
     crop_h = max_y - min_y + 1
 
-    s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
-    s_img.fill(Qt.transparent)
+    s_img = QImage(crop_w, crop_h, QImage.Format.Format_ARGB32)
+    s_img.fill(Qt.GlobalColor.transparent)
 
     for y in range(crop_h):
         for x in range(crop_w):
@@ -122,12 +122,12 @@ canvas.save('{output_png_path}')
                 alpha = int(min(255, lum))
                 s_img.setPixelColor(x, y, QColor(255, 255, 255, alpha))
 
-    canvas = QImage(1024, 1024, QImage.Format_ARGB32)
-    canvas.fill(Qt.transparent)
+    canvas = QImage(1024, 1024, QImage.Format.Format_ARGB32)
+    canvas.fill(Qt.GlobalColor.transparent)
 
     painter = QPainter(canvas)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     # Squircle 840x840 centered, 185 px radius, #0A0A0A fill, 2px rgba(255,255,255,0.12) border
     squircle_rect = QRectF(92.0, 92.0, 840.0, 840.0)
@@ -244,8 +244,8 @@ def install_app_bundle(repo_dir: Path, target_path: Path = APP_PATH) -> Path:
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": BUNDLE_ID,
-        "CFBundleVersion": "1.0.1",
-        "CFBundleShortVersionString": "1.0.1",
+        "CFBundleVersion": "1.1.0",
+        "CFBundleShortVersionString": "1.1.0",
         "CFBundleIconFile": "Spokn",
         "CFBundlePackageType": "APPL",
         "CFBundleExecutable": APP_NAME,

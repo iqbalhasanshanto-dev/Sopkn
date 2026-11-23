@@ -94,14 +94,14 @@ class DictationPillOverlay(QWidget):
         # Note: Do not use Qt.Tool as macOS automatically hides Qt.Tool windows when
         # another app is active. Use Qt.Window with native NSWindow configuration instead.
         self.setWindowFlags(
-            Qt.Window
-            | Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.WindowDoesNotAcceptFocus
-            | Qt.NoDropShadowWindowHint
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.NoDropShadowWindowHint
         )
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         # Current state and animated dimensions
         self._state = PillState.IDLE
@@ -118,7 +118,7 @@ class DictationPillOverlay(QWidget):
         # Spring morph animation (220 ms OutBack)
         self._morph_anim = QVariantAnimation(self)
         self._morph_anim.setDuration(220)
-        spring_curve = QEasingCurve(QEasingCurve.OutBack)
+        spring_curve = QEasingCurve(QEasingCurve.Type.OutBack)
         spring_curve.setOvershoot(1.15)
         self._morph_anim.setEasingCurve(spring_curve)
         self._morph_anim.valueChanged.connect(self._on_morph_frame)
@@ -286,7 +286,7 @@ class DictationPillOverlay(QWidget):
 
             # Set accessory activation policy so Python never appears in Dock or steals menu bar
             activation_policy_accessory = getattr(AppKit, "NSApplicationActivationPolicyAccessory", 1)
-            AppKit.NSApp.setActivationPolicy_(activation_policy_accessory)
+            AppKit.NSApp.setActivationPolicy_(activation_policy_accessory)  # type: ignore[attr-defined]
 
             NSFloatingWindowLevel = getattr(AppKit, "NSFloatingWindowLevel", 3)
             CAN_JOIN_ALL_SPACES = getattr(AppKit, "NSWindowCollectionBehaviorCanJoinAllSpaces", 1 << 0)
@@ -294,7 +294,7 @@ class DictationPillOverlay(QWidget):
             FULL_SCREEN_AUX = getattr(AppKit, "NSWindowCollectionBehaviorFullScreenAuxiliary", 1 << 8)
             NON_ACTIVATING_PANEL = getattr(AppKit, "NSWindowStyleMaskNonactivatingPanel", 1 << 7)
 
-            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))  # type: ignore[attr-defined]
             ns_window = ns_view.window() if ns_view is not None else None
             if ns_window is not None:
                 # Do not hide when Python/Spokn loses active application focus
@@ -317,8 +317,8 @@ class DictationPillOverlay(QWidget):
     def paintEvent(self, event) -> None:
         """Paint the Dictation Pill capsule, border, shadow, and inner controls."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         pill_rect = QRectF(self.PADDING, self.PADDING, self._current_w, self._current_h)
         corner_radius = self._current_h / 2.0
@@ -329,7 +329,7 @@ class DictationPillOverlay(QWidget):
             self._paint_rim_glow(painter, pill_rect, corner_radius)
 
         # 2. Pill capsule fill: solid #0A0A0A
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(self.COLOR_PILL_BG))
         painter.drawRoundedRect(pill_rect, corner_radius, corner_radius)
 
@@ -337,7 +337,7 @@ class DictationPillOverlay(QWidget):
         border_alpha = int(255 * 0.45) if self._state == PillState.IDLE else int(255 * 0.65)
         border_pen = QPen(QColor(255, 255, 255, border_alpha), 1.2)
         painter.setPen(border_pen)
-        painter.setBrush(Qt.NoBrush)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         # Inset stroke by 0.6px for crisp inside 1.2px stroke
         inset_rect = pill_rect.adjusted(0.6, 0.6, -0.6, -0.6)
         painter.drawRoundedRect(inset_rect, max(0.0, corner_radius - 0.6), max(0.0, corner_radius - 0.6))
@@ -356,7 +356,7 @@ class DictationPillOverlay(QWidget):
     def _paint_rim_glow(self, painter: QPainter, pill_rect: QRectF, radius: float) -> None:
         """Paint 2-3 very tight soft white halo passes (1-3 px spread, low alpha ~10-18%)."""
         painter.save()
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         glow_passes = [
             (3.0, int(255 * 0.10)),
             (2.0, int(255 * 0.14)),
@@ -371,7 +371,7 @@ class DictationPillOverlay(QWidget):
     def _paint_shadow(self, painter: QPainter, pill_rect: QRectF, radius: float) -> None:
         """Paint soft, low-alpha elevation shadow without visible outer ring artifacts."""
         painter.save()
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         blur_steps = 8
         dy = 3.0
         for i in range(blur_steps, 0, -1):
@@ -437,7 +437,7 @@ class DictationPillOverlay(QWidget):
             dot_center = QPointF(dots_start_x + 2.0 + i * 7.0, cy)
             is_active = (i == self._processing_phase)
             color = self.COLOR_WHITE if is_active else self.COLOR_DOT_INACTIVE
-            painter.setPen(Qt.NoPen)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(color))
             painter.drawEllipse(dot_center, 2.0, 2.0)
 
@@ -449,13 +449,13 @@ class DictationPillOverlay(QWidget):
         # Circle background
         face_color = QColor(self.COLOR_CANCEL_BG)
         face_color.setAlpha(int(face_color.alpha() * opacity))
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(face_color))
         painter.drawEllipse(center, radius, radius)
 
         # If full size (24 px), draw white '×' icon
         if size >= 16.0:
-            pen = QPen(self.COLOR_WHITE, 1.5, Qt.SolidLine, Qt.RoundCap)
+            pen = QPen(self.COLOR_WHITE, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             r = 3.5
             painter.drawLine(QPointF(center.x() - r, center.y() - r), QPointF(center.x() + r, center.y() + r))
@@ -471,7 +471,7 @@ class DictationPillOverlay(QWidget):
         # Red circle background
         face_color = QColor(self.COLOR_STOP_RED)
         face_color.setAlpha(int(255 * opacity))
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(face_color))
         painter.drawEllipse(center, radius, radius)
 
@@ -484,7 +484,7 @@ class DictationPillOverlay(QWidget):
                 square_size,
                 square_size,
             )
-            painter.setPen(Qt.NoPen)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(self.COLOR_WHITE))
             painter.drawRoundedRect(sq_rect, 1.5, 1.5)
 
@@ -493,7 +493,7 @@ class DictationPillOverlay(QWidget):
     def _paint_waveform(self, painter: QPainter, start_x: float, cy: float, is_active: bool) -> None:
         """Paint 10 vertical white bars (2 px width, 3 px gap, 1 px radius)."""
         painter.save()
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(self.COLOR_WHITE))
 
         bar_width = 2.0
@@ -515,7 +515,7 @@ class DictationPillOverlay(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """Handle mouse clicks on the pill and edge buttons."""
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton:
             return
 
         pos = event.position()

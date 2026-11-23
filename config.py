@@ -6,7 +6,7 @@ hotkey bindings, visual overlay, and clipboard injection are defined here.
 
 # Application identity
 APP_NAME = "Spokn"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 # Model repository on Hugging Face / MLX
 # Default: High-accuracy multilingual model optimized for Apple Silicon unified memory.

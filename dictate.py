@@ -31,16 +31,15 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 import urllib.request
 import AppKit
-import Foundation
 import mlx_whisper
 import numpy as np
-import objc
 from pynput import keyboard
-from PySide6.QtCore import QBuffer, QIODevice, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtCore import QCoreApplication, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QApplication, QMenu
 import sounddevice as sd
 
 import config
@@ -165,181 +164,6 @@ def clean_with_ollama(text: str) -> str:
 # 5 speech-range frequency bands spanning ~120 Hz to 3800 Hz
 # (from strongest vocal fundamentals b0 to high presence b4)
 SPEECH_BAND_EDGES = [120.0, 280.0, 650.0, 1400.0, 2600.0, 3800.0]
-
-
-def create_tray_icon() -> QIcon:
-    """Create a crisp 36x36 px @2x Retina monochrome 'S' template icon for macOS menu bar.
-
-    Extracts the 'S' shape from logo.png, turns bright pixels into black with anti-aliasing,
-    crops tightly to its bounding box, centers inside a 36x36 px pixmap with ~4 px
-    padding, and marks it as a macOS template mask (setIsMask(True)).
-    """
-    logo_path = Path(__file__).parent / "logo.png"
-    if not logo_path.exists():
-        pix = QPixmap(36, 36)
-        pix.fill(Qt.transparent)
-        pix.setDevicePixelRatio(2.0)
-        icon = QIcon(pix)
-        icon.setIsMask(True)
-        return icon
-
-    img = QImage(str(logo_path))
-    if img.isNull():
-        pix = QPixmap(36, 36)
-        pix.fill(Qt.transparent)
-        pix.setDevicePixelRatio(2.0)
-        icon = QIcon(pix)
-        icon.setIsMask(True)
-        return icon
-
-    # Find tight bounding box of bright pixels (luminance > 128)
-    min_x, max_x = img.width(), 0
-    min_y, max_y = img.height(), 0
-
-    for y in range(img.height()):
-        for x in range(img.width()):
-            c = QColor(img.pixel(x, y))
-            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
-            if lum > 128:
-                if x < min_x: min_x = x
-                if x > max_x: max_x = x
-                if y < min_y: min_y = y
-                if y > max_y: max_y = y
-
-    if min_x > max_x or min_y > max_y:
-        min_x, max_x, min_y, max_y = 0, img.width() - 1, 0, img.height() - 1
-
-    crop_w = max_x - min_x + 1
-    crop_h = max_y - min_y + 1
-
-    s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
-    s_img.fill(Qt.transparent)
-
-    for y in range(crop_h):
-        for x in range(crop_w):
-            c = QColor(img.pixel(min_x + x, min_y + y))
-            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
-            if lum > 50:
-                alpha = int(min(255, lum))
-                s_img.setPixelColor(x, y, QColor(0, 0, 0, alpha))
-
-    # 36x36 px @2x Retina pixmap (18x18 pt logical size)
-    pix = QPixmap(36, 36)
-    pix.fill(Qt.transparent)
-    pix.setDevicePixelRatio(2.0)
-
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-
-    # 1.5 pt padding on each side (= 3 px @2x padding) -> 15.0x15.0 pt content
-    target_rect = QRectF(1.5, 1.5, 15.0, 15.0)
-    painter.drawImage(target_rect, s_img)
-    painter.end()
-
-    icon = QIcon(pix)
-    icon.setIsMask(True)
-    return icon
-
-
-class MenuHandler(Foundation.NSObject):
-    """PyObjC target-action bridge routing macOS status bar menu clicks to Qt main thread."""
-
-    app_ref = None
-
-    @objc.IBAction
-    def toggleDictation_(self, sender: object) -> None:
-        if MenuHandler.app_ref is not None:
-            QTimer.singleShot(0, MenuHandler.app_ref.handle_hotkey_toggle)
-
-    @objc.IBAction
-    def toggleOllama_(self, sender: object) -> None:
-        if MenuHandler.app_ref is not None:
-            new_state = (sender.state() == 0)
-            sender.setState_(1 if new_state else 0)
-            QTimer.singleShot(0, lambda: MenuHandler.app_ref._set_ollama_cleanup(new_state))
-
-    @objc.IBAction
-    def restartApp_(self, sender: object) -> None:
-        if MenuHandler.app_ref is not None:
-            qapp = QApplication.instance()
-            QTimer.singleShot(0, lambda: MenuHandler.app_ref.restart_and_reexec(qapp))
-
-    @objc.IBAction
-    def quitApp_(self, sender: object) -> None:
-        if MenuHandler.app_ref is not None:
-            qapp = QApplication.instance()
-            QTimer.singleShot(0, lambda: MenuHandler.app_ref.stop_and_exit(qapp))
-
-
-def create_status_bar_image() -> AppKit.NSImage | None:
-    """Render the cropped black 'S' from logo.png into an AppKit.NSImage template.
-
-    36x36 px PNG in memory (filling ~30x30 px so it matches the visual weight of
-    the Figma and Gemini menu bar icons), with setSize_((18, 18)) and setTemplate_(True).
-    """
-    logo_path = Path(__file__).parent / "logo.png"
-    if not logo_path.exists():
-        return None
-
-    img = QImage(str(logo_path))
-    if img.isNull():
-        return None
-
-    min_x, max_x = img.width(), 0
-    min_y, max_y = img.height(), 0
-
-    for y in range(img.height()):
-        for x in range(img.width()):
-            c = QColor(img.pixel(x, y))
-            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
-            if lum > 128:
-                if x < min_x: min_x = x
-                if x > max_x: max_x = x
-                if y < min_y: min_y = y
-                if y > max_y: max_y = y
-
-    if min_x > max_x or min_y > max_y:
-        min_x, max_x, min_y, max_y = 0, img.width() - 1, 0, img.height() - 1
-
-    crop_w = max_x - min_x + 1
-    crop_h = max_y - min_y + 1
-
-    s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
-    s_img.fill(Qt.transparent)
-
-    for y in range(crop_h):
-        for x in range(crop_w):
-            c = QColor(img.pixel(min_x + x, min_y + y))
-            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
-            if lum > 50:
-                alpha = int(min(255, lum))
-                s_img.setPixelColor(x, y, QColor(0, 0, 0, alpha))
-
-    # 36x36 px canvas in memory, drawing S into ~30x30 px area
-    pix = QImage(36, 36, QImage.Format_ARGB32)
-    pix.fill(Qt.transparent)
-
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-
-    target_rect = QRectF(3.0, 3.0, 30.0, 30.0)
-    painter.drawImage(target_rect, s_img)
-    painter.end()
-
-    buf = QBuffer()
-    buf.open(QIODevice.WriteOnly)
-    pix.save(buf, "PNG")
-    png_bytes = bytes(buf.data())
-    buf.close()
-
-    ns_data = Foundation.NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
-    ns_image = AppKit.NSImage.alloc().initWithData_(ns_data)
-    if ns_image is not None:
-        ns_image.setSize_((18, 18))
-        ns_image.setTemplate_(True)
-    return ns_image
 
 
 class AudioRecorder:
@@ -556,7 +380,11 @@ class Transcriber:
                 initial_prompt=config.INITIAL_PROMPT,
                 condition_on_previous_text=False,
             )
-            return result.get("text", "").strip()
+            if isinstance(result, dict):
+                text_val = result.get("text", "")
+                if isinstance(text_val, str):
+                    return text_val.strip()
+            return ""
         except Exception as exc:
             print(
                 f"[{config.APP_NAME}] Transcription error: {exc}",
@@ -699,7 +527,7 @@ class DictationApp:
         self._hotkey_is_down: bool = False
 
         # Last active third-party application tracking (for focus restoration)
-        self._last_active_app: object | None = None
+        self._last_active_app: Any = None
         self._record_last_active_app()
 
         # Polling timer to keep last active app updated every 300 ms
@@ -708,67 +536,12 @@ class DictationApp:
         self._app_tracker_timer.timeout.connect(self._record_last_active_app)
         self._app_tracker_timer.start()
 
-        # Minimal native macOS Menu-Bar Icon via AppKit.NSStatusBar
+        # Context menu on right-clicking the floating Dictation Pill
         self.use_ollama_cleanup: bool = getattr(config, "USE_OLLAMA_CLEANUP", False)
-        self._menu_handler = MenuHandler.alloc().init()
-        MenuHandler.app_ref = self
-        self._status_item: AppKit.NSStatusItem | None = None
-        self._status_menu_item: AppKit.NSMenuItem | None = None
-        self._ollama_menu_item: AppKit.NSMenuItem | None = None
-
-        try:
-            status_bar = AppKit.NSStatusBar.systemStatusBar()
-            self._status_item = status_bar.statusItemWithLength_(
-                AppKit.NSVariableStatusItemLength
-            )
-            ns_icon = create_status_bar_image()
-            button = self._status_item.button()
-            if button is not None:
-                if ns_icon is not None:
-                    button.setImage_(ns_icon)
-                button.setToolTip_(f"{config.APP_NAME} v{config.APP_VERSION}")
-
-            native_menu = AppKit.NSMenu.alloc().init()
-            self._status_menu_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"{config.APP_NAME} v{config.APP_VERSION} — Ready", None, ""
-            )
-            self._status_menu_item.setEnabled_(False)
-            native_menu.addItem_(self._status_menu_item)
-
-            toggle_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Start / Stop Dictation", "toggleDictation:", ""
-            )
-            toggle_item.setTarget_(self._menu_handler)
-            native_menu.addItem_(toggle_item)
-
-            self._ollama_menu_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Ollama Cleanup", "toggleOllama:", ""
-            )
-            self._ollama_menu_item.setTarget_(self._menu_handler)
-            self._ollama_menu_item.setState_(1 if self.use_ollama_cleanup else 0)
-            native_menu.addItem_(self._ollama_menu_item)
-
-            native_menu.addItem_(AppKit.NSMenuItem.separatorItem())
-
-            restart_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Restart Spokn", "restartApp:", ""
-            )
-            restart_item.setTarget_(self._menu_handler)
-            native_menu.addItem_(restart_item)
-
-            quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Quit Spokn", "quitApp:", ""
-            )
-            quit_item.setTarget_(self._menu_handler)
-            native_menu.addItem_(quit_item)
-
-            self._status_item.setMenu_(native_menu)
-        except Exception as exc:
-            print(f"[{config.APP_NAME}] Notice initializing native menu bar status item: {exc}", flush=True)
-
-        # Context menu on right-clicking the floating pill
         self._pill_menu = QMenu()
-        self._pill_status_action = self._pill_menu.addAction(f"{config.APP_NAME} v{config.APP_VERSION} — Ready")
+        self._pill_status_action = self._pill_menu.addAction(
+            f"{config.APP_NAME} v{config.APP_VERSION} — Ready"
+        )
         self._pill_status_action.setEnabled(False)
 
         self._pill_toggle_action = self._pill_menu.addAction("Start / Stop Dictation")
@@ -787,7 +560,7 @@ class DictationApp:
         self._pill_quit_action = self._pill_menu.addAction("Quit Spokn")
         self._pill_quit_action.triggered.connect(lambda: self.stop_and_exit(QApplication.instance()))
 
-        self.overlay.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.overlay.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.overlay.customContextMenuRequested.connect(self._on_overlay_context_menu)
 
     def _record_last_active_app(self) -> None:
@@ -796,7 +569,7 @@ class DictationApp:
             import os
             import AppKit
 
-            workspace = AppKit.NSWorkspace.sharedWorkspace()
+            workspace = AppKit.NSWorkspace.sharedWorkspace()  # type: ignore[attr-defined]
             front_app = workspace.frontmostApplication()
             if front_app is not None and front_app.processIdentifier() != os.getpid():
                 self._last_active_app = front_app
@@ -839,8 +612,6 @@ class DictationApp:
     def _set_ollama_cleanup(self, enabled: bool) -> None:
         """Toggle Ollama post-processing cleanup live."""
         self.use_ollama_cleanup = enabled
-        if self._ollama_menu_item is not None:
-            self._ollama_menu_item.setState_(1 if enabled else 0)
         if hasattr(self, "_pill_ollama_action") and self._pill_ollama_action is not None:
             self._pill_ollama_action.setChecked(enabled)
         status = "enabled" if enabled else "disabled"
@@ -858,9 +629,7 @@ class DictationApp:
             self._pill_menu.exec(self.overlay.mapToGlobal(pos))
 
     def _update_tray_status(self, status: str) -> None:
-        """Update live status in the macOS menu bar and pill context menu."""
-        if self._status_menu_item is not None:
-            self._status_menu_item.setTitle_(f"{config.APP_NAME} v{config.APP_VERSION} — {status}")
+        """Update live status in the pill context menu."""
         if hasattr(self, "_pill_status_action") and self._pill_status_action is not None:
             self._pill_status_action.setText(f"{config.APP_NAME} v{config.APP_VERSION} — {status}")
 
@@ -871,7 +640,7 @@ class DictationApp:
         # Check accessibility permissions
         try:
             import ApplicationServices
-            if not ApplicationServices.AXIsProcessTrusted():
+            if not ApplicationServices.AXIsProcessTrusted():  # type: ignore[attr-defined]
                 print(
                     f"[{config.APP_NAME}] Warning: macOS Accessibility permissions are not yet enabled for Spokn.\n"
                     f"    Please grant access in System Settings -> Privacy & Security -> Accessibility\n"
@@ -1101,7 +870,7 @@ class DictationApp:
     # Shutdown & Restart
     # -------------------------------------------------------------------------
 
-    def restart_and_reexec(self, app: QApplication) -> None:
+    def restart_and_reexec(self, app: QCoreApplication | None) -> None:
         """Cleanly shut down Spokn, release the instance lock, and re-exec the process."""
         print(f"\n[{config.APP_NAME}] Restarting...", flush=True)
         try:
@@ -1115,7 +884,7 @@ class DictationApp:
             print(f"[{config.APP_NAME}] Restart failed: {exc}", flush=True)
             os._exit(1)
 
-    def stop_and_exit(self, app: QApplication, do_sys_exit: bool = True) -> None:
+    def stop_and_exit(self, app: QCoreApplication | None, do_sys_exit: bool = True) -> None:
         """Clean up audio, listener, overlay, and lock, then exit the application."""
         print(f"\n[{config.APP_NAME}] Exiting cleanly...", flush=True)
         try:
@@ -1130,12 +899,6 @@ class DictationApp:
             self.overlay.set_audio_bands([0.0] * 10)
         except Exception:
             pass
-        if self._status_item is not None:
-            try:
-                AppKit.NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
-            except Exception:
-                pass
-            self._status_item = None
         if self.recorder.is_recording:
             try:
                 self.recorder.cancel()
@@ -1153,10 +916,11 @@ class DictationApp:
         release_single_instance_lock()
 
         if do_sys_exit:
-            try:
-                app.quit()
-            except Exception:
-                pass
+            if app is not None:
+                try:
+                    app.quit()
+                except Exception:
+                    pass
             # Immediate Force Quit fallback so background threads or PortAudio handles never hang
             os._exit(0)
 
@@ -1168,11 +932,11 @@ def main() -> None:
 
     app = QApplication.instance() or QApplication(sys.argv)
 
-    # Set macOS accessory activation policy immediately before constructing any UI or tray elements
+    # Set macOS accessory activation policy immediately before constructing any UI elements
     try:
         import AppKit
         activation_policy_accessory = getattr(AppKit, "NSApplicationActivationPolicyAccessory", 1)
-        AppKit.NSApp.setActivationPolicy_(activation_policy_accessory)
+        AppKit.NSApp.setActivationPolicy_(activation_policy_accessory)  # type: ignore[attr-defined]
     except Exception:
         pass
 
