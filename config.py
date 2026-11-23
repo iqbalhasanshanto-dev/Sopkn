@@ -68,4 +68,4 @@ TRAILING_SPACE = True
 USE_OLLAMA_CLEANUP = False
 OLLAMA_MODEL = "llama3.2:3b"
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_TIMEOUT = 3.0
+OLLAMA_TIMEOUT = 1.5

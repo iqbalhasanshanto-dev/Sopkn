@@ -108,7 +108,10 @@ class DictationPillOverlay(QWidget):
         self._current_w = self.STATE_SIZES[PillState.IDLE][0]
         self._current_h = self.STATE_SIZES[PillState.IDLE][1]
 
-        # Live vocal frequency bands (10 speech bands in range 0.0 to 1.0) and bar heights
+        # Live vocal level (0.0 to 1.0) and animated bar heights
+        self._audio_level: float = 0.0
+        self._smoothed_level: float = 0.0
+        self._wave_phase: float = 0.0
         self._audio_bands: list[float] = [0.0] * 10
         self._bar_heights: list[float] = [2.0] * 10
 
@@ -120,9 +123,9 @@ class DictationPillOverlay(QWidget):
         self._morph_anim.setEasingCurve(spring_curve)
         self._morph_anim.valueChanged.connect(self._on_morph_frame)
 
-        # ~30 FPS (33 ms) waveform animation timer for live vocal amplitude
+        # 60 FPS (16 ms) waveform animation timer for silky-smooth live vocal amplitude
         self._waveform_timer = QTimer(self)
-        self._waveform_timer.setInterval(33)
+        self._waveform_timer.setInterval(16)
         self._waveform_timer.timeout.connect(self._on_waveform_tick)
 
         # 160 ms pulsing sequencer for Processing dots
@@ -162,6 +165,9 @@ class DictationPillOverlay(QWidget):
                 self._waveform_timer.start()
         else:
             self._waveform_timer.stop()
+            self._audio_level = 0.0
+            self._smoothed_level = 0.0
+            self._wave_phase = 0.0
             self._audio_bands = [0.0] * 10
             self._bar_heights = [2.0] * 10
 
@@ -186,10 +192,13 @@ class DictationPillOverlay(QWidget):
         """Set 10 live vocal frequency band amplitudes (each 0.0 to 1.0)."""
         if len(bands) == 10:
             self._audio_bands = [max(0.0, min(1.0, float(b))) for b in bands]
+            # Use peak of incoming bands as target level for smoothed envelope
+            self._audio_level = max(self._audio_bands)
 
     def set_audio_level(self, level: float) -> None:
-        """Set uniform audio level across all bands (fallback helper)."""
+        """Set live vocal audio level (0.0 to 1.0) to modulate 60 FPS waveform."""
         clamped = max(0.0, min(1.0, float(level)))
+        self._audio_level = clamped
         self._audio_bands = [clamped] * 10
 
     # -------------------------------------------------------------------------
@@ -204,18 +213,30 @@ class DictationPillOverlay(QWidget):
         self.update()
 
     def _on_waveform_tick(self) -> None:
-        """Advance the live vocal waveform at ~30 FPS (33 ms) with fast attack and smooth decay."""
+        """Advance the live vocal waveform at 60 FPS (16 ms) with two-stage envelope and center ripple."""
+        target_level = self._audio_level
+        if target_level > self._smoothed_level:
+            # Fast attack (0.24)
+            self._smoothed_level += (target_level - self._smoothed_level) * 0.24
+        else:
+            # Smooth decay (0.12)
+            self._smoothed_level += (target_level - self._smoothed_level) * 0.12
+
+        # Traveling center-outward sine modulation
+        if self._smoothed_level > 0.01:
+            self._wave_phase = (self._wave_phase + 0.18) % (2.0 * math.pi)
+        else:
+            self._wave_phase = 0.0
+
+        # Symmetrical center-outward bell curve weights (bars 4 & 5 peak at center)
+        BELL = [0.25, 0.45, 0.68, 0.88, 1.0, 1.0, 0.88, 0.68, 0.45, 0.25]
+
         for i in range(10):
-            band = self._audio_bands[i] if i < len(self._audio_bands) else 0.0
-            target_h = 2.0 + 16.0 * band
+            sine_mod = 1.0 + 0.18 * math.sin(self._wave_phase - abs(i - 4.5) * 0.55)
+            target_h = 2.0 + 16.0 * self._smoothed_level * BELL[i] * sine_mod
 
             current_h = self._bar_heights[i]
-            if target_h > current_h:
-                # Fast attack (0.55)
-                current_h += (target_h - current_h) * 0.55
-            else:
-                # Smooth decay (0.22)
-                current_h += (target_h - current_h) * 0.22
+            current_h += (target_h - current_h) * 0.28
 
             # Settle flat to 2.0 px dots during pauses to prevent sub-pixel fractions
             if current_h < 2.05:
