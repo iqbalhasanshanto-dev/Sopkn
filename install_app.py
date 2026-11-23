@@ -34,6 +34,183 @@ LAUNCH_AGENT_PLIST = LAUNCH_AGENTS_DIR / f"{BUNDLE_ID}.plist"
 LOG_PATH = Path.home() / "Library" / "Logs" / f"{APP_NAME}.log"
 
 
+def generate_squircle_png(logo_path: Path, output_png_path: Path) -> bool:
+    """Render a 1024x1024 macOS squircle icon with the bold white S symbol."""
+    try:
+        from PySide6.QtGui import QImage, QColor, QPainter, QPen, QBrush
+        from PySide6.QtCore import Qt, QRectF
+    except ImportError:
+        # Fallback to invoking .venv python if running under system python without PySide6
+        venv_python = logo_path.parent / ".venv" / "bin" / "python"
+        if venv_python.exists():
+            script = f"""
+from PySide6.QtGui import QImage, QColor, QPainter, QPen, QBrush
+from PySide6.QtCore import Qt, QRectF
+img = QImage('{logo_path}')
+min_x, max_x = img.width(), 0
+min_y, max_y = img.height(), 0
+for y in range(img.height()):
+    for x in range(img.width()):
+        c = QColor(img.pixel(x, y))
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        if lum > 128:
+            if x < min_x: min_x = x
+            if x > max_x: max_x = x
+            if y < min_y: min_y = y
+            if y > max_y: max_y = y
+crop_w = max_x - min_x + 1
+crop_h = max_y - min_y + 1
+s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
+s_img.fill(Qt.transparent)
+for y in range(crop_h):
+    for x in range(crop_w):
+        c = QColor(img.pixel(min_x + x, min_y + y))
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        if lum > 40:
+            alpha = int(min(255, lum))
+            s_img.setPixelColor(x, y, QColor(255, 255, 255, alpha))
+canvas = QImage(1024, 1024, QImage.Format_ARGB32)
+canvas.fill(Qt.transparent)
+painter = QPainter(canvas)
+painter.setRenderHint(QPainter.Antialiasing, True)
+painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+squircle_rect = QRectF(92.0, 92.0, 840.0, 840.0)
+pen = QPen(QColor(255, 255, 255, 31), 2.0)
+painter.setPen(pen)
+painter.setBrush(QBrush(QColor('#0A0A0A')))
+painter.drawRoundedRect(squircle_rect, 185.0, 185.0)
+s_rect = QRectF(252.0, 252.0, 520.0, 520.0)
+painter.drawImage(s_rect, s_img)
+painter.end()
+canvas.save('{output_png_path}')
+"""
+            res = subprocess.run([str(venv_python), "-c", script], capture_output=True)
+            return res.returncode == 0
+        return False
+
+    img = QImage(str(logo_path))
+    if img.isNull():
+        return False
+
+    min_x, max_x = img.width(), 0
+    min_y, max_y = img.height(), 0
+
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = QColor(img.pixel(x, y))
+            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+            if lum > 128:
+                if x < min_x: min_x = x
+                if x > max_x: max_x = x
+                if y < min_y: min_y = y
+                if y > max_y: max_y = y
+
+    if min_x > max_x or min_y > max_y:
+        min_x, max_x, min_y, max_y = 0, img.width() - 1, 0, img.height() - 1
+
+    crop_w = max_x - min_x + 1
+    crop_h = max_y - min_y + 1
+
+    s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
+    s_img.fill(Qt.transparent)
+
+    for y in range(crop_h):
+        for x in range(crop_w):
+            c = QColor(img.pixel(min_x + x, min_y + y))
+            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+            if lum > 40:
+                alpha = int(min(255, lum))
+                s_img.setPixelColor(x, y, QColor(255, 255, 255, alpha))
+
+    canvas = QImage(1024, 1024, QImage.Format_ARGB32)
+    canvas.fill(Qt.transparent)
+
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+    # Squircle 840x840 centered, 185 px radius, #0A0A0A fill, 2px rgba(255,255,255,0.12) border
+    squircle_rect = QRectF(92.0, 92.0, 840.0, 840.0)
+    pen = QPen(QColor(255, 255, 255, 31), 2.0)
+    painter.setPen(pen)
+    painter.setBrush(QBrush(QColor("#0A0A0A")))
+    painter.drawRoundedRect(squircle_rect, 185.0, 185.0)
+
+    # S symbol centered, ~520 px tall (62% of squircle)
+    s_rect = QRectF(252.0, 252.0, 520.0, 520.0)
+    painter.drawImage(s_rect, s_img)
+    painter.end()
+
+    return canvas.save(str(output_png_path))
+
+
+def generate_icns(logo_path: Path, output_icns_path: Path) -> bool:
+    """Convert logo.png into a native macOS .icns file using PySide6 and iconutil."""
+    if not logo_path.exists():
+        print(f"[!] logo.png not found at {logo_path}, skipping .icns generation.")
+        return False
+
+    temp_dir = Path("/tmp") / "spokn_icon_build"
+    iconset_dir = temp_dir / "Spokn.iconset"
+    master_png = temp_dir / "Spokn_1024.png"
+
+    try:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        iconset_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Render 1024x1024 macOS squircle PNG with bold white S
+        if not generate_squircle_png(logo_path, master_png):
+            print("[!] Failed to render master squircle PNG.")
+            return False
+
+        # 2. Standard macOS iconset dimensions
+        sizes = [
+            ("icon_16x16.png", 16),
+            ("icon_16x16@2x.png", 32),
+            ("icon_32x32.png", 32),
+            ("icon_32x32@2x.png", 64),
+            ("icon_128x128.png", 128),
+            ("icon_128x128@2x.png", 256),
+            ("icon_256x256.png", 256),
+            ("icon_256x256@2x.png", 512),
+            ("icon_512x512.png", 512),
+            ("icon_512x512@2x.png", 1024),
+        ]
+
+        for filename, size in sizes:
+            out_file = iconset_dir / filename
+            subprocess.run(
+                [
+                    "sips",
+                    "-z",
+                    str(size),
+                    str(size),
+                    str(master_png),
+                    "--out",
+                    str(out_file),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+        # 3. Convert iconset to icns using iconutil
+        output_icns_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["iconutil", "-c", "icns", str(iconset_dir), "-o", str(output_icns_path)],
+            check=True,
+            capture_output=True,
+        )
+        print(f"[+] Generated bold application icon at {output_icns_path}")
+        return True
+    except Exception as exc:
+        print(f"[!] Warning generating .icns: {exc}")
+        return False
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def install_app_bundle(repo_dir: Path, target_path: Path = APP_PATH) -> Path:
     """Build and install Spokn.app bundle."""
     venv_python = repo_dir / ".venv" / "bin" / "python"
@@ -59,13 +236,17 @@ def install_app_bundle(repo_dir: Path, target_path: Path = APP_PATH) -> Path:
     macos_dir.mkdir(parents=True, exist_ok=True)
     resources_dir.mkdir(parents=True, exist_ok=True)
 
+    # Generate Spokn.icns icon
+    generate_icns(repo_dir / "logo.png", resources_dir / "Spokn.icns")
+
     # 1. Write Contents/Info.plist with LSUIElement=True (no Dock icon, silent agent)
     info_plist_data = {
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": BUNDLE_ID,
-        "CFBundleVersion": "1.0.0",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleVersion": "1.0.1",
+        "CFBundleShortVersionString": "1.0.1",
+        "CFBundleIconFile": "Spokn",
         "CFBundlePackageType": "APPL",
         "CFBundleExecutable": APP_NAME,
         "LSUIElement": True,
@@ -100,6 +281,9 @@ exec "$PYTHON_BIN" "$ENTRY_SCRIPT" >> "$LOG_FILE" 2>&1
         f.write(launcher_content)
 
     os.chmod(launcher_path, 0o755)
+
+    # Touch bundle to notify Finder / Spotlight of metadata and icon update
+    subprocess.run(["touch", str(target_path)], check=False)
 
     print(f"[+] Successfully installed {APP_NAME}.app to {target_path}")
     return target_path

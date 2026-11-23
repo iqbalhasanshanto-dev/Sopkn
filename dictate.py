@@ -31,10 +31,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import numpy as np
 from pynput import keyboard
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 import sounddevice as sd
 import mlx_whisper
@@ -108,41 +109,129 @@ def apply_corrections(text: str) -> str:
     return corrected
 
 
+def clean_with_ollama(text: str) -> str:
+    """Clean transcribed text using a local Ollama model (fix punctuation, remove filler words).
+
+    Falls back immediately and silently to original text if Ollama is unreachable or times out.
+    """
+    if not text or not text.strip():
+        return text
+
+    system_instruction = (
+        "You are an expert speech-to-text post-processor. "
+        "Clean up the following dictated text by fixing punctuation, capitalization, and grammar, "
+        "removing verbal filler words (e.g. 'um', 'uh', 'you know', 'like'), and smoothing stutters. "
+        "Preserve the exact original meaning, vocabulary, and technical terms. "
+        "Output ONLY the cleaned transcription with no surrounding quotes, markdown formatting, or preamble."
+    )
+
+    payload = json.dumps({
+        "model": getattr(config, "OLLAMA_MODEL", "llama3.2:3b"),
+        "prompt": text,
+        "system": system_instruction,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        getattr(config, "OLLAMA_URL", "http://localhost:11434/api/generate"),
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        timeout_sec = getattr(config, "OLLAMA_TIMEOUT", 3.0)
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            if response.status == 200:
+                body = json.loads(response.read().decode("utf-8"))
+                cleaned = body.get("response", "").strip()
+                if cleaned:
+                    if (cleaned.startswith('"') and cleaned.endswith('"')) or (
+                        cleaned.startswith("'") and cleaned.endswith("'")
+                    ):
+                        cleaned = cleaned[1:-1].strip()
+                    return cleaned
+    except Exception as exc:
+        print(f"[{config.APP_NAME}] Ollama cleanup bypassed ({exc}). Using Whisper output.", flush=True)
+
+    return text
+
+
 # 5 speech-range frequency bands spanning ~120 Hz to 3800 Hz
 # (from strongest vocal fundamentals b0 to high presence b4)
 SPEECH_BAND_EDGES = [120.0, 280.0, 650.0, 1400.0, 2600.0, 3800.0]
 
 
 def create_tray_icon() -> QIcon:
-    """Create a crisp 44x44 px @2x Retina monochrome microphone template icon for macOS menu bar."""
-    pix = QPixmap(44, 44)
+    """Create a crisp 36x36 px @2x Retina monochrome 'S' template icon for macOS menu bar.
+
+    Extracts the 'S' shape from logo.png, turns bright pixels into black with anti-aliasing,
+    crops tightly to its bounding box, centers inside a 36x36 px pixmap with ~4 px
+    padding, and marks it as a macOS template mask (setIsMask(True)).
+    """
+    logo_path = Path(__file__).parent / "logo.png"
+    if not logo_path.exists():
+        pix = QPixmap(36, 36)
+        pix.fill(Qt.transparent)
+        pix.setDevicePixelRatio(2.0)
+        icon = QIcon(pix)
+        icon.setIsMask(True)
+        return icon
+
+    img = QImage(str(logo_path))
+    if img.isNull():
+        pix = QPixmap(36, 36)
+        pix.fill(Qt.transparent)
+        pix.setDevicePixelRatio(2.0)
+        icon = QIcon(pix)
+        icon.setIsMask(True)
+        return icon
+
+    # Find tight bounding box of bright pixels (luminance > 128)
+    min_x, max_x = img.width(), 0
+    min_y, max_y = img.height(), 0
+
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = QColor(img.pixel(x, y))
+            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+            if lum > 128:
+                if x < min_x: min_x = x
+                if x > max_x: max_x = x
+                if y < min_y: min_y = y
+                if y > max_y: max_y = y
+
+    if min_x > max_x or min_y > max_y:
+        min_x, max_x, min_y, max_y = 0, img.width() - 1, 0, img.height() - 1
+
+    crop_w = max_x - min_x + 1
+    crop_h = max_y - min_y + 1
+
+    s_img = QImage(crop_w, crop_h, QImage.Format_ARGB32)
+    s_img.fill(Qt.transparent)
+
+    for y in range(crop_h):
+        for x in range(crop_w):
+            c = QColor(img.pixel(min_x + x, min_y + y))
+            lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+            if lum > 50:
+                alpha = int(min(255, lum))
+                s_img.setPixelColor(x, y, QColor(0, 0, 0, alpha))
+
+    # 36x36 px @2x Retina pixmap (18x18 pt logical size)
+    pix = QPixmap(36, 36)
     pix.fill(Qt.transparent)
     pix.setDevicePixelRatio(2.0)
 
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
-    # 1. Mic capsule (solid fill)
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QBrush(QColor(0, 0, 0, 255)))
-    painter.drawRoundedRect(QRectF(7.8, 2.5, 6.4, 10.5), 3.2, 3.2)
-
-    # 2. U-shaped cradle
-    pen = QPen(QColor(0, 0, 0, 255), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-    painter.setPen(pen)
-    painter.setBrush(Qt.NoBrush)
-
-    cradle = QPainterPath()
-    cradle.moveTo(5.4, 7.5)
-    cradle.lineTo(5.4, 11.0)
-    cradle.arcTo(QRectF(5.4, 6.5, 11.2, 9.0), 180, -180)
-    cradle.lineTo(16.6, 7.5)
-    painter.drawPath(cradle)
-
-    # 3. Stem & base stand
-    painter.drawLine(QPointF(11.0, 15.5), QPointF(11.0, 18.5))
-    painter.drawLine(QPointF(7.5, 18.5), QPointF(14.5, 18.5))
-
+    # 2.0 pt padding on each side (= 4 px @2x padding) -> 14.0x14.0 pt content
+    target_rect = QRectF(2.0, 2.0, 14.0, 14.0)
+    painter.drawImage(target_rect, s_img)
     painter.end()
 
     icon = QIcon(pix)
@@ -515,26 +604,36 @@ class DictationApp:
         self._app_tracker_timer.start()
 
         # Minimal macOS Menu-Bar Tray Icon
+        self.use_ollama_cleanup: bool = getattr(config, "USE_OLLAMA_CLEANUP", False)
         self.tray_icon = QSystemTrayIcon(create_tray_icon(), self.overlay)
-        self.tray_icon.setToolTip(config.APP_NAME)
+        self.tray_icon.setToolTip(f"{config.APP_NAME} v{config.APP_VERSION}")
         self.tray_menu = QMenu()
 
-        self._status_action = self.tray_menu.addAction(f"{config.APP_NAME} — Ready")
+        self._status_action = self.tray_menu.addAction(f"{config.APP_NAME} v{config.APP_VERSION} — Ready")
         self._status_action.setEnabled(False)
 
         self._toggle_action = self.tray_menu.addAction("Start / Stop Dictation")
         self._toggle_action.triggered.connect(self.handle_hotkey_toggle)
 
-        self._restart_action = self.tray_menu.addAction("Restart Spokn")
-        self._restart_action.triggered.connect(lambda: self.restart_and_reexec(QApplication.instance()))
+        self._ollama_action = self.tray_menu.addAction("Ollama Cleanup")
+        self._ollama_action.setCheckable(True)
+        self._ollama_action.setChecked(self.use_ollama_cleanup)
+        self._ollama_action.toggled.connect(self._set_ollama_cleanup)
 
         self.tray_menu.addSeparator()
+
+        self._restart_action = self.tray_menu.addAction("Restart Spokn")
+        self._restart_action.triggered.connect(lambda: self.restart_and_reexec(QApplication.instance()))
 
         self._quit_action = self.tray_menu.addAction("Quit Spokn")
         self._quit_action.triggered.connect(lambda: self.stop_and_exit(QApplication.instance()))
 
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.show()
+
+        # Context menu on right-clicking the floating pill
+        self.overlay.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.overlay.customContextMenuRequested.connect(self._on_overlay_context_menu)
 
     def _record_last_active_app(self) -> None:
         """Track the most recent frontmost application that is not Spokn/Python."""
@@ -582,10 +681,27 @@ class DictationApp:
         self._restore_last_active_app()
         self.cancel_dictation()
 
+    def _set_ollama_cleanup(self, enabled: bool) -> None:
+        """Toggle Ollama post-processing cleanup live."""
+        self.use_ollama_cleanup = enabled
+        status = "enabled" if enabled else "disabled"
+        print(f"[{config.APP_NAME}] Ollama Cleanup {status}.", flush=True)
+
+    def _on_overlay_context_menu(self, pos: QPoint) -> None:
+        """Display context menu when right-clicking on the pill."""
+        pill_rect = QRectF(
+            self.overlay.PADDING,
+            self.overlay.PADDING,
+            self.overlay._current_w,
+            self.overlay._current_h,
+        )
+        if pill_rect.contains(pos):
+            self.tray_menu.exec(self.overlay.mapToGlobal(pos))
+
     def _update_tray_status(self, status: str) -> None:
         """Update live status in the macOS menu bar tray menu."""
         if hasattr(self, "_status_action") and self._status_action is not None:
-            self._status_action.setText(f"{config.APP_NAME} — {status}")
+            self._status_action.setText(f"{config.APP_NAME} v{config.APP_VERSION} — {status}")
 
     def start(self) -> None:
         """Show overlay, start global keyboard listener, and warm up model in background."""
@@ -617,7 +733,7 @@ class DictationApp:
             with self._lock:
                 self.is_ready = True
             print(
-                f"[{config.APP_NAME}] Ready. Double-tap Right Command or click pill to talk (Ctrl+C to quit).",
+                f"[{config.APP_NAME} v{config.APP_VERSION}] Ready. Double-tap Right Command or click pill to talk (Ctrl+C to quit).",
                 flush=True,
             )
 
@@ -773,6 +889,12 @@ class DictationApp:
                 print(f"[{config.APP_NAME}] No speech detected.", flush=True)
             else:
                 text = apply_corrections(text)
+                if self.use_ollama_cleanup:
+                    text = clean_with_ollama(text)
+
+                if getattr(config, "TRAILING_SPACE", True) and text and not text[-1].isspace():
+                    text += " "
+
                 print(f"[{config.APP_NAME}] Transcribed: {text}", flush=True)
                 self._restore_last_active_app()
                 paste_text(text)

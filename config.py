@@ -6,6 +6,7 @@ hotkey bindings, visual overlay, and clipboard injection are defined here.
 
 # Application identity
 APP_NAME = "Spokn"
+APP_VERSION = "1.0.1"
 
 # Model repository on Hugging Face / MLX
 # Default: High-accuracy multilingual model optimized for Apple Silicon unified memory.
@@ -54,3 +55,17 @@ MIN_RECORDING_DURATION = 0.3
 # Clipboard automation timing
 # Delay in seconds to wait after sending Cmd+V before restoring original clipboard contents.
 CLIPBOARD_RESTORE_DELAY = 0.15
+
+# Smart spacing
+# Automatically append a single trailing space to pasted text if not already ending in whitespace,
+# ensuring consecutive dictations never mash words together.
+TRAILING_SPACE = True
+
+# Optional Local Ollama Post-Processing Cleanup
+# When enabled via the menu bar toggle or config, queries a local Ollama model to fix punctuation,
+# remove filler words ("um", "uh"), and smooth stutters before pasting.
+# Off by default so Whisper dictation remains instant unless explicitly activated.
+USE_OLLAMA_CLEANUP = False
+OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_TIMEOUT = 3.0
