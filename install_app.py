@@ -202,6 +202,16 @@ def generate_icns(logo_path: Path, output_icns_path: Path) -> bool:
             capture_output=True,
         )
         print(f"[+] Generated bold application icon at {output_icns_path}")
+
+        # 4. Export clean 256x256 transparent-background squircle icon for GitHub assets
+        assets_dir = logo_path.parent / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        asset_png = assets_dir / "app-icon.png"
+        icon_256 = iconset_dir / "icon_256x256.png"
+        if icon_256.exists():
+            shutil.copy2(icon_256, asset_png)
+            print(f"[+] Exported 256x256 squircle icon to {asset_png}")
+
         return True
     except Exception as exc:
         print(f"[!] Warning generating .icns: {exc}")
