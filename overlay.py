@@ -86,7 +86,6 @@ class DictationPillOverlay(QWidget):
 
     # Figma Waveform Layout Constants (10 vertical bars, 2 px width, 3 px gap, 1 px radius)
     WAVEFORM_FLAT = [2.0] * 10
-    BELL_WEIGHTS = [0.35, 0.52, 0.74, 0.92, 1.00, 1.00, 0.92, 0.74, 0.52, 0.35]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -109,11 +108,9 @@ class DictationPillOverlay(QWidget):
         self._current_w = self.STATE_SIZES[PillState.IDLE][0]
         self._current_h = self.STATE_SIZES[PillState.IDLE][1]
 
-        # Live vocal waveform amplitude tracking and bar heights
-        self._audio_level = 0.0
-        self._smoothed_level = 0.0
-        self._bar_heights = [2.0] * 10
-        self._anim_phase = 0.0
+        # Live vocal frequency bands (10 speech bands in range 0.0 to 1.0) and bar heights
+        self._audio_bands: list[float] = [0.0] * 10
+        self._bar_heights: list[float] = [2.0] * 10
 
         # Spring morph animation (220 ms OutBack)
         self._morph_anim = QVariantAnimation(self)
@@ -165,10 +162,8 @@ class DictationPillOverlay(QWidget):
                 self._waveform_timer.start()
         else:
             self._waveform_timer.stop()
-            self._audio_level = 0.0
-            self._smoothed_level = 0.0
+            self._audio_bands = [0.0] * 10
             self._bar_heights = [2.0] * 10
-            self._anim_phase = 0.0
 
         if state == PillState.PROCESSING:
             if not self._processing_timer.isActive():
@@ -187,9 +182,15 @@ class DictationPillOverlay(QWidget):
         self._morph_anim.setEndValue(QSizeF(target_w, target_h))
         self._morph_anim.start()
 
+    def set_audio_bands(self, bands: list[float]) -> None:
+        """Set 10 live vocal frequency band amplitudes (each 0.0 to 1.0)."""
+        if len(bands) == 10:
+            self._audio_bands = [max(0.0, min(1.0, float(b))) for b in bands]
+
     def set_audio_level(self, level: float) -> None:
-        """Modulate the waveform bar heights based on live audio amplitude (0.0 to 1.0)."""
-        self._audio_level = max(0.0, min(1.0, level))
+        """Set uniform audio level across all bands (fallback helper)."""
+        clamped = max(0.0, min(1.0, float(level)))
+        self._audio_bands = [clamped] * 10
 
     # -------------------------------------------------------------------------
     # Geometry & Animation Callbacks
@@ -204,31 +205,24 @@ class DictationPillOverlay(QWidget):
 
     def _on_waveform_tick(self) -> None:
         """Advance the live vocal waveform at ~30 FPS (33 ms) with fast attack and smooth decay."""
-        target = self._audio_level
+        for i in range(10):
+            band = self._audio_bands[i] if i < len(self._audio_bands) else 0.0
+            target_h = 2.0 + 16.0 * band
 
-        # Fast attack (rapid rise on speech onset) / smooth decay (natural release)
-        if target > self._smoothed_level:
-            self._smoothed_level += (target - self._smoothed_level) * 0.45
-        else:
-            self._smoothed_level += (target - self._smoothed_level) * 0.18
+            current_h = self._bar_heights[i]
+            if target_h > current_h:
+                # Fast attack (0.55)
+                current_h += (target_h - current_h) * 0.55
+            else:
+                # Smooth decay (0.22)
+                current_h += (target_h - current_h) * 0.22
 
-        # Settle flat if below threshold to prevent microscopic oscillation during pauses
-        if self._smoothed_level < 0.005:
-            self._smoothed_level = 0.0
-            self._bar_heights = [2.0] * 10
-            self.update()
-            return
+            # Settle flat to 2.0 px dots during pauses to prevent sub-pixel fractions
+            if current_h < 2.05:
+                current_h = 2.0
 
-        self._anim_phase += 0.25
+            self._bar_heights[i] = max(2.0, min(18.0, current_h))
 
-        # Center-weighted bell curve with organic variation proportional to speech level
-        heights = []
-        for i, weight in enumerate(self.BELL_WEIGHTS):
-            ripple = 1.0 + 0.15 * math.sin(self._anim_phase + i * 0.85)
-            h = 2.0 + 16.0 * self._smoothed_level * weight * ripple
-            heights.append(max(2.0, min(18.0, h)))
-
-        self._bar_heights = heights
         self.update()
 
     def _on_processing_tick(self) -> None:

@@ -10,7 +10,7 @@ It uses Apple's [MLX](https://github.com/ml-explore/mlx) framework via `mlx-whis
 
 - **100% Offline & Private**: Audio never leaves your Mac. Zero external API calls or telemetry.
 - **Apple Silicon Optimized**: Leverages Apple Silicon unified memory and GPU/Neural Engine via MLX.
-- **Hold-to-Talk (Wispr Flow Style)**: Hold `Right Option` to speak, release to transcribe and paste.
+- **Double-Tap Dictation**: Double-tap `Right Command` (`cmd_r`) to start speaking, double-tap again (or click Stop) to transcribe and paste. Alternate: `"f5"` or `"alt_r"`.
 - **Non-Destructive Clipboard**: Copies and pastes the transcript at the cursor (`Cmd+V`), then restores your prior clipboard content.
 
 ---
@@ -57,7 +57,7 @@ Spokn interacts with your microphone and global system events. You must grant pe
    - Enable access for your terminal application (e.g., Terminal, iTerm2, Ghostty, VS Code) or the packaged application.
 2. **Accessibility**:
    - Navigate to **System Settings → Privacy & Security → Accessibility**.
-   - Enable access for your terminal application so `pynput` can monitor global hotkeys (Right Option) and simulate keystrokes (`Cmd+V` paste).
+   - Enable access for your terminal application so `pynput` can monitor global hotkeys (Right Command) and simulate keystrokes (`Cmd+V` paste).
 
 ---
 
@@ -69,7 +69,9 @@ All customizable settings are located in [`config.py`](file:///Users/shanto/Deve
 | :--- | :--- | :--- |
 | `APP_NAME` | `"Spokn"` | Name of the application |
 | `MODEL_REPO` | `"mlx-community/whisper-small.en-mlx"` | Local MLX model repo (Optional upgrade: `"mlx-community/whisper-large-v3-turbo"`) |
-| `HOTKEY` | `"alt_r"` | Hold-to-talk trigger (Right Option key) |
+| `HOTKEY` | `"cmd_r"` | Trigger hotkey (`cmd_r` for Right Command; alternate: `"f5"` or `"alt_r"`) |
+| `HOTKEY_MODE` | `"double_tap"` | Triggering behavior (`"double_tap"`, `"toggle"`, or `"hold"`) |
+| `DOUBLE_TAP_WINDOW` | `0.35` | Maximum seconds between two taps for double-tap detection |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (16kHz required by Whisper) |
 | `CHANNELS` | `1` | Audio channels (mono) |
 | `DTYPE` | `"int16"` | Audio buffer data type |
@@ -99,8 +101,53 @@ Replacements are reloaded dynamically on each transcription without needing to r
 
 ## Running Spokn
 
-Run the entry point from your virtual environment:
+### Option A: Run in Terminal (CLI Mode)
+
+Run the entry point directly from your virtual environment:
 
 ```bash
 python dictate.py
 ```
+
+### Option B: Install as a Native macOS Background App (Recommended)
+
+You can install Spokn as a native background application (`/Applications/Spokn.app`) that runs silently with:
+- **No Dock icon** (`LSUIElement=true`)
+- **No Terminal window**
+- **Monochrome menu-bar icon** with live status indicators and toggle controls
+- **Automatic logging** to `~/Library/Logs/Spokn.log`
+
+#### 1. Build and install `/Applications/Spokn.app`:
+
+```bash
+python install_app.py
+```
+
+To also configure Spokn to start automatically whenever you log into your Mac:
+
+```bash
+python install_app.py --autostart
+```
+
+*(To disable launch-at-login later, run: `python install_app.py --remove-autostart`)*
+
+#### 2. Grant macOS Permissions for `Spokn.app`:
+
+Navigate to **System Settings → Privacy & Security**:
+- **Microphone**: Click `+` and add `/Applications/Spokn.app` (or allow when prompted).
+- **Accessibility**: Click `+` and add `/Applications/Spokn.app` (enables global `Right Command` hotkey monitoring and `Cmd+V` text paste).
+
+#### 3. Launch and Dictate:
+
+Launch Spokn:
+```bash
+open /Applications/Spokn.app
+```
+
+- **Double-tap Right Command (`cmd_r`)** or click the floating pill to start speaking.
+- Double-tap again (or click Stop on the pill) to stop and paste.
+- Click the Spokn icon in your macOS menu bar to view status or quit.
+- To monitor live transcription logs:
+  ```bash
+  tail -f ~/Library/Logs/Spokn.log
+  ```

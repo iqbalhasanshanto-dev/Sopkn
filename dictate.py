@@ -31,8 +31,9 @@ import threading
 import time
 import numpy as np
 from pynput import keyboard
-from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 import sounddevice as sd
 import mlx_whisper
 
@@ -72,10 +73,39 @@ def apply_corrections(text: str) -> str:
     return corrected
 
 
-# 10 speech-range frequency bands spanning ~120 Hz to 3800 Hz
-SPEECH_BAND_EDGES = [
-    120.0, 220.0, 360.0, 550.0, 800.0, 1200.0, 1700.0, 2300.0, 2900.0, 3400.0, 3800.0
-]
+# 5 speech-range frequency bands spanning ~120 Hz to 3800 Hz
+# (from strongest vocal fundamentals b0 to high presence b4)
+SPEECH_BAND_EDGES = [120.0, 280.0, 650.0, 1400.0, 2600.0, 3800.0]
+
+
+def create_tray_icon() -> QIcon:
+    """Create a crisp 36x36 px @2x Retina monochrome template icon for the macOS menu bar."""
+    pix = QPixmap(36, 36)
+    pix.fill(Qt.transparent)
+    pix.setDevicePixelRatio(2.0)
+
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    # Minimalist capsule outline matching Spokn Dictation Pill
+    pen = QPen(QColor(0, 0, 0, 255), 1.5)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    pill_rect = QRectF(1.5, 4.5, 15.0, 9.0)
+    painter.drawRoundedRect(pill_rect, 4.5, 4.5)
+
+    # 3 subtle center waveform bars inside
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(QColor(0, 0, 0, 255)))
+    painter.drawRoundedRect(QRectF(5.5, 7.0, 1.2, 4.0), 0.6, 0.6)
+    painter.drawRoundedRect(QRectF(8.4, 6.0, 1.2, 6.0), 0.6, 0.6)
+    painter.drawRoundedRect(QRectF(11.3, 7.0, 1.2, 4.0), 0.6, 0.6)
+
+    painter.end()
+
+    icon = QIcon(pix)
+    icon.setIsMask(True)
+    return icon
 
 
 class AudioRecorder:
@@ -84,7 +114,7 @@ class AudioRecorder:
     Thread Safety:
     - Never calls Qt functions or emits Qt signals from _audio_callback (the PortAudio
       real-time audio thread).
-    - Computes peak-hold RMS volume and a 10-band speech spectrum, storing them
+    - Computes peak-hold RMS volume and a 5-band speech spectrum, storing them
       atomically for the Qt main thread to poll safely via consume_audio_levels().
     """
 
@@ -94,7 +124,7 @@ class AudioRecorder:
         self._is_recording: bool = False
         self._stream: sd.InputStream | None = None
         self._peak_rms: float = 0.0
-        self._peak_bands: list[float] = [0.0] * 10
+        self._peak_bands: list[float] = [0.0] * 5
 
     @property
     def is_recording(self) -> bool:
@@ -107,11 +137,11 @@ class AudioRecorder:
         return self._peak_rms
 
     def consume_audio_levels(self) -> tuple[float, list[float]]:
-        """Atomically read and reset peak RMS and 10-band spectrum since the last poll."""
+        """Atomically read and reset peak RMS and 5-band spectrum since the last poll."""
         rms = self._peak_rms
         bands = list(self._peak_bands)
         self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 10
+        self._peak_bands = [0.0] * 5
         return rms, bands
 
     def _audio_callback(
@@ -141,12 +171,12 @@ class AudioRecorder:
             if chunk_rms > self._peak_rms:
                 self._peak_rms = chunk_rms
 
-            # Compute 10-band speech spectrum (~120 Hz to 3800 Hz) via rfft
+            # Compute 5-band speech spectrum (~120 Hz to 3800 Hz) via rfft
             rfft_mag = np.abs(np.fft.rfft(data_float))
             freqs = np.fft.rfftfreq(n_samples, d=1.0 / config.SAMPLE_RATE)
             fft_norm = rfft_mag / (n_samples / 2.0)
 
-            for i in range(10):
+            for i in range(5):
                 f_low = SPEECH_BAND_EDGES[i]
                 f_high = SPEECH_BAND_EDGES[i + 1]
                 mask = (freqs >= f_low) & (freqs < f_high)
@@ -165,7 +195,7 @@ class AudioRecorder:
 
         self._buffer.clear()
         self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 10
+        self._peak_bands = [0.0] * 5
         try:
             self._stream = sd.InputStream(
                 samplerate=config.SAMPLE_RATE,
@@ -195,7 +225,7 @@ class AudioRecorder:
         """Stop and close the audio stream, then concatenate and normalize captured audio."""
         self._is_recording = False
         self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 10
+        self._peak_bands = [0.0] * 5
 
         if self._stream is not None:
             try:
@@ -232,7 +262,7 @@ class AudioRecorder:
         """Stop and close the audio stream, discarding captured chunks without returning audio."""
         self._is_recording = False
         self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 10
+        self._peak_bands = [0.0] * 5
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -428,6 +458,30 @@ class DictationApp:
         self._other_key_pressed: bool = False
         self._hotkey_held: bool = False
 
+        # Minimal macOS Menu-Bar Tray Icon
+        self.tray_icon = QSystemTrayIcon(create_tray_icon(), self.overlay)
+        self.tray_icon.setToolTip(config.APP_NAME)
+        self.tray_menu = QMenu()
+
+        self._status_action = self.tray_menu.addAction(f"{config.APP_NAME} — Ready")
+        self._status_action.setEnabled(False)
+
+        self._toggle_action = self.tray_menu.addAction("Start / Stop Dictation")
+        self._toggle_action.triggered.connect(self.handle_hotkey_toggle)
+
+        self.tray_menu.addSeparator()
+
+        self._quit_action = self.tray_menu.addAction("Quit Spokn")
+        self._quit_action.triggered.connect(lambda: self.stop_and_exit(QApplication.instance()))
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.show()
+
+    def _update_tray_status(self, status: str) -> None:
+        """Update live status in the macOS menu bar tray menu."""
+        if hasattr(self, "_status_action") and self._status_action is not None:
+            self._status_action.setText(f"{config.APP_NAME} — {status}")
+
     def start(self) -> None:
         """Show overlay, start global keyboard listener, and warm up model in background."""
         self.overlay.show()
@@ -476,6 +530,7 @@ class DictationApp:
         if self.recorder.start():
             self._current_state = PillState.LISTENING
             self.overlay.set_state(PillState.LISTENING)
+            self._update_tray_status("Listening")
             self._level_timer.start()
             print(f"[{config.APP_NAME}] Listening...", flush=True)
 
@@ -492,6 +547,7 @@ class DictationApp:
         if audio is None:
             self._current_state = PillState.IDLE
             self.overlay.set_state(PillState.IDLE)
+            self._update_tray_status("Ready")
             print(f"[{config.APP_NAME}] Ignored short recording.", flush=True)
             print(f"[{config.APP_NAME}] Ready.", flush=True)
             return
@@ -499,6 +555,7 @@ class DictationApp:
         # Transition to COLLAPSING (which auto-morphs to PROCESSING after 220 ms)
         self._current_state = PillState.PROCESSING
         self.overlay.set_state(PillState.COLLAPSING)
+        self._update_tray_status("Transcribing")
         print(f"[{config.APP_NAME}] Transcribing...", flush=True)
 
         worker = threading.Thread(
@@ -517,6 +574,7 @@ class DictationApp:
         self.recorder.cancel()
         self._current_state = PillState.IDLE
         self.overlay.set_state(PillState.IDLE)
+        self._update_tray_status("Ready")
         print(f"[{config.APP_NAME}] Dictation canceled.", flush=True)
         print(f"[{config.APP_NAME}] Ready.", flush=True)
 
@@ -545,15 +603,22 @@ class DictationApp:
 
                 max_band = max(raw_bands) if raw_bands else 0.0
                 if max_band > 1e-6:
-                    # Spectral equalization tilt across speech frequencies (formants to sibilance)
-                    tilt = [0.9, 0.95, 1.0, 1.05, 1.15, 1.25, 1.35, 1.45, 1.55, 1.65]
-                    scaled_bands = []
+                    # Spectral tilt across the 5 speech bands (vocal fundamentals to high presence)
+                    tilt = [1.0, 1.1, 1.25, 1.45, 1.7]
+                    b_levels = []
                     for i, b in enumerate(raw_bands):
                         norm_b = min(1.0, (b / max_band) * tilt[i])
                         band_val = speech_level * (0.35 + 0.65 * norm_b)
-                        scaled_bands.append(min(1.0, max(0.0, band_val)))
+                        b_levels.append(min(1.0, max(0.0, band_val)))
                 else:
-                    scaled_bands = [speech_level] * 10
+                    b_levels = [speech_level] * 5
+
+                # Symmetrical center-outward mapping into 10 bars:
+                # [b4, b3, b2, b1, b0, b0, b1, b2, b3, b4]
+                # Center bars (4 & 5) take strongest vocal fundamentals (b0),
+                # rippling outward to both edges (b4)
+                b0, b1, b2, b3, b4 = b_levels
+                scaled_bands = [b4, b3, b2, b1, b0, b0, b1, b2, b3, b4]
 
             self.overlay.set_audio_bands(scaled_bands)
 
@@ -574,6 +639,7 @@ class DictationApp:
             with self._lock:
                 self.is_processing = False
                 self._current_state = PillState.IDLE
+            self._update_tray_status("Ready")
             try:
                 self.ui_bridge.state_changed.emit(PillState.IDLE)
             except RuntimeError:
@@ -634,6 +700,7 @@ class DictationApp:
         print(f"\n[{config.APP_NAME}] Exiting cleanly...", flush=True)
         self._level_timer.stop()
         self.overlay.set_audio_bands([0.0] * 10)
+        self.tray_icon.hide()
         if self.recorder.is_recording:
             self.recorder.cancel()
         if self._listener is not None and self._listener.is_alive():
