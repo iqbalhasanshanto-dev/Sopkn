@@ -21,7 +21,9 @@ Architecture & V1 Flow:
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from pathlib import Path
 import re
 import signal
@@ -31,14 +33,47 @@ import threading
 import time
 import numpy as np
 from pynput import keyboard
-from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 import sounddevice as sd
 import mlx_whisper
 
 import config
 from overlay import DictationPillOverlay, PillState
+
+
+LOCK_FILE_PATH = "/tmp/spokn.lock"
+_lock_file_fd: int | None = None
+
+
+def acquire_single_instance_lock() -> int:
+    """Acquire a non-blocking exclusive file lock on /tmp/spokn.lock.
+
+    If another instance of Spokn is already running, exits cleanly with sys.exit(0)
+    so launching Spokn while it is already active never spawns a conflicting duplicate.
+    """
+    global _lock_file_fd
+    try:
+        fd = os.open(LOCK_FILE_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file_fd = fd
+        return fd
+    except (BlockingIOError, OSError):
+        print(f"[{config.APP_NAME}] Already running. Exiting duplicate instance.", flush=True)
+        sys.exit(0)
+
+
+def release_single_instance_lock() -> None:
+    """Release the single-instance file lock if held."""
+    global _lock_file_fd
+    if _lock_file_fd is not None:
+        try:
+            fcntl.flock(_lock_file_fd, fcntl.LOCK_UN)
+            os.close(_lock_file_fd)
+        except Exception:
+            pass
+        _lock_file_fd = None
 
 
 class UiBridge(QObject):
@@ -79,27 +114,34 @@ SPEECH_BAND_EDGES = [120.0, 280.0, 650.0, 1400.0, 2600.0, 3800.0]
 
 
 def create_tray_icon() -> QIcon:
-    """Create a crisp 36x36 px @2x Retina monochrome template icon for the macOS menu bar."""
-    pix = QPixmap(36, 36)
+    """Create a crisp 44x44 px @2x Retina monochrome microphone template icon for macOS menu bar."""
+    pix = QPixmap(44, 44)
     pix.fill(Qt.transparent)
     pix.setDevicePixelRatio(2.0)
 
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.Antialiasing, True)
 
-    # Minimalist capsule outline matching Spokn Dictation Pill
-    pen = QPen(QColor(0, 0, 0, 255), 1.5)
-    painter.setPen(pen)
-    painter.setBrush(Qt.NoBrush)
-    pill_rect = QRectF(1.5, 4.5, 15.0, 9.0)
-    painter.drawRoundedRect(pill_rect, 4.5, 4.5)
-
-    # 3 subtle center waveform bars inside
+    # 1. Mic capsule (solid fill)
     painter.setPen(Qt.NoPen)
     painter.setBrush(QBrush(QColor(0, 0, 0, 255)))
-    painter.drawRoundedRect(QRectF(5.5, 7.0, 1.2, 4.0), 0.6, 0.6)
-    painter.drawRoundedRect(QRectF(8.4, 6.0, 1.2, 6.0), 0.6, 0.6)
-    painter.drawRoundedRect(QRectF(11.3, 7.0, 1.2, 4.0), 0.6, 0.6)
+    painter.drawRoundedRect(QRectF(7.8, 2.5, 6.4, 10.5), 3.2, 3.2)
+
+    # 2. U-shaped cradle
+    pen = QPen(QColor(0, 0, 0, 255), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    cradle = QPainterPath()
+    cradle.moveTo(5.4, 7.5)
+    cradle.lineTo(5.4, 11.0)
+    cradle.arcTo(QRectF(5.4, 6.5, 11.2, 9.0), 180, -180)
+    cradle.lineTo(16.6, 7.5)
+    painter.drawPath(cradle)
+
+    # 3. Stem & base stand
+    painter.drawLine(QPointF(11.0, 15.5), QPointF(11.0, 18.5))
+    painter.drawLine(QPointF(7.5, 18.5), QPointF(14.5, 18.5))
 
     painter.end()
 
@@ -125,6 +167,7 @@ class AudioRecorder:
         self._stream: sd.InputStream | None = None
         self._peak_rms: float = 0.0
         self._peak_bands: list[float] = [0.0] * 5
+        self._stream_lock = threading.Lock()
 
     @property
     def is_recording(self) -> bool:
@@ -190,95 +233,98 @@ class AudioRecorder:
 
     def start(self) -> bool:
         """Reset buffer and open/start the sounddevice InputStream."""
-        if self._is_recording:
-            return True
+        with self._stream_lock:
+            if self._is_recording:
+                return True
 
-        self._buffer.clear()
-        self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 5
-        try:
-            self._stream = sd.InputStream(
-                samplerate=config.SAMPLE_RATE,
-                channels=config.CHANNELS,
-                dtype=config.DTYPE,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-            self._is_recording = True
-            return True
-        except Exception as exc:
-            print(
-                f"[{config.APP_NAME}] Failed to start audio recording: {exc}\n"
-                f"Please ensure microphone permissions are granted and PortAudio is installed.",
-                flush=True,
-            )
-            self._is_recording = False
-            if self._stream is not None:
-                try:
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
-            return False
+            self._buffer.clear()
+            self._peak_rms = 0.0
+            self._peak_bands = [0.0] * 5
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=config.SAMPLE_RATE,
+                    channels=config.CHANNELS,
+                    dtype=config.DTYPE,
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+                self._is_recording = True
+                return True
+            except Exception as exc:
+                print(
+                    f"[{config.APP_NAME}] Failed to start audio recording: {exc}\n"
+                    f"Please ensure microphone permissions are granted and PortAudio is installed.",
+                    flush=True,
+                )
+                self._is_recording = False
+                if self._stream is not None:
+                    try:
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                return False
 
     def stop(self) -> np.ndarray | None:
         """Stop and close the audio stream, then concatenate and normalize captured audio."""
-        self._is_recording = False
-        self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 5
+        with self._stream_lock:
+            self._is_recording = False
+            self._peak_rms = 0.0
+            self._peak_bands = [0.0] * 5
 
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            except Exception as exc:
-                print(f"[{config.APP_NAME}] Warning stopping audio stream: {exc}", flush=True)
+            if self._stream is not None:
                 try:
-                    self._stream.abort()
-                except Exception:
-                    pass
-            try:
-                self._stream.close()
-            except Exception as exc:
-                print(f"[{config.APP_NAME}] Warning closing audio stream: {exc}", flush=True)
-            finally:
-                self._stream = None
+                    self._stream.stop()
+                except Exception as exc:
+                    print(f"[{config.APP_NAME}] Warning stopping audio stream: {exc}", flush=True)
+                    try:
+                        self._stream.abort()
+                    except Exception:
+                        pass
+                try:
+                    self._stream.close()
+                except Exception as exc:
+                    print(f"[{config.APP_NAME}] Warning closing audio stream: {exc}", flush=True)
+                finally:
+                    self._stream = None
 
-        if not self._buffer:
-            return None
+            if not self._buffer:
+                return None
 
-        # Concatenate all captured chunks along axis 0 and flatten to 1D
-        audio_int16 = np.concatenate(self._buffer, axis=0).flatten()
+            # Concatenate all captured chunks along axis 0 and flatten to 1D
+            audio_int16 = np.concatenate(self._buffer, axis=0).flatten()
 
-        duration = len(audio_int16) / config.SAMPLE_RATE
-        if duration < config.MIN_RECORDING_DURATION:
-            # Reject recordings that are too short to avoid false triggers
-            return None
+            duration = len(audio_int16) / config.SAMPLE_RATE
+            if duration < config.MIN_RECORDING_DURATION:
+                # Reject recordings that are too short to avoid false triggers
+                return None
 
-        # Normalize int16 PCM to float32 in range [-1.0, 1.0]
-        audio_float32 = audio_int16.astype(np.float32) / 32768.0
-        return audio_float32
+            # Normalize int16 PCM to float32 in range [-1.0, 1.0]
+            audio_float32 = audio_int16.astype(np.float32) / 32768.0
+            return audio_float32
 
     def cancel(self) -> None:
         """Stop and close the audio stream, discarding captured chunks without returning audio."""
-        self._is_recording = False
-        self._peak_rms = 0.0
-        self._peak_bands = [0.0] * 5
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            except Exception as exc:
-                print(f"[{config.APP_NAME}] Warning stopping audio stream: {exc}", flush=True)
+        with self._stream_lock:
+            self._is_recording = False
+            self._peak_rms = 0.0
+            self._peak_bands = [0.0] * 5
+            if self._stream is not None:
                 try:
-                    self._stream.abort()
-                except Exception:
-                    pass
-            try:
-                self._stream.close()
-            except Exception as exc:
-                print(f"[{config.APP_NAME}] Warning closing audio stream: {exc}", flush=True)
-            finally:
-                self._stream = None
-        self._buffer.clear()
+                    self._stream.stop()
+                except Exception as exc:
+                    print(f"[{config.APP_NAME}] Warning stopping audio stream: {exc}", flush=True)
+                    try:
+                        self._stream.abort()
+                    except Exception:
+                        pass
+                try:
+                    self._stream.close()
+                except Exception as exc:
+                    print(f"[{config.APP_NAME}] Warning closing audio stream: {exc}", flush=True)
+                finally:
+                    self._stream = None
+            self._buffer.clear()
 
 
 class Transcriber:
@@ -479,6 +525,9 @@ class DictationApp:
         self._toggle_action = self.tray_menu.addAction("Start / Stop Dictation")
         self._toggle_action.triggered.connect(self.handle_hotkey_toggle)
 
+        self._restart_action = self.tray_menu.addAction("Restart Spokn")
+        self._restart_action.triggered.connect(lambda: self.restart_and_reexec(QApplication.instance()))
+
         self.tray_menu.addSeparator()
 
         self._quit_action = self.tray_menu.addAction("Quit Spokn")
@@ -604,22 +653,16 @@ class DictationApp:
             print(f"[{config.APP_NAME}] Listening...", flush=True)
 
     def stop_dictation(self) -> None:
-        """Stop recording, trigger COLLAPSING -> PROCESSING, and transcribe."""
-        if not self.recorder.is_recording:
-            return
+        """Stop recording, trigger COLLAPSING -> PROCESSING immediately, and transcribe on worker thread."""
+        with self._lock:
+            if not self.recorder.is_recording or self.is_processing:
+                return
+            self.is_processing = True
 
+        # Immediately update UI state on Qt main thread without waiting for PortAudio
         self._level_timer.stop()
         self.overlay.set_audio_bands([0.0] * 10)
         self.overlay.set_audio_level(0.0)
-
-        audio = self.recorder.stop()
-        if audio is None:
-            self._current_state = PillState.IDLE
-            self.overlay.set_state(PillState.IDLE)
-            self._update_tray_status("Ready")
-            print(f"[{config.APP_NAME}] Ignored short recording.", flush=True)
-            print(f"[{config.APP_NAME}] Ready.", flush=True)
-            return
 
         # Transition to COLLAPSING (which auto-morphs to PROCESSING after 220 ms)
         self._current_state = PillState.PROCESSING
@@ -627,9 +670,26 @@ class DictationApp:
         self._update_tray_status("Transcribing")
         print(f"[{config.APP_NAME}] Transcribing...", flush=True)
 
+        def _stop_and_process_worker() -> None:
+            # Stop audio stream in background worker thread (never blocks Qt event loop)
+            audio = self.recorder.stop()
+            if audio is None:
+                with self._lock:
+                    self.is_processing = False
+                    self._current_state = PillState.IDLE
+                self._update_tray_status("Ready")
+                try:
+                    self.ui_bridge.state_changed.emit(PillState.IDLE)
+                except RuntimeError:
+                    pass
+                print(f"[{config.APP_NAME}] Ignored short recording.", flush=True)
+                print(f"[{config.APP_NAME}] Ready.", flush=True)
+                return
+
+            self.process_audio(audio)
+
         worker = threading.Thread(
-            target=self.process_audio,
-            args=(audio,),
+            target=_stop_and_process_worker,
             daemon=True,
             name="AudioProcessorThread",
         )
@@ -637,15 +697,26 @@ class DictationApp:
 
     def cancel_dictation(self) -> None:
         """Cancel recording immediately and return to IDLE without transcribing."""
+        with self._lock:
+            if not self.recorder.is_recording:
+                return
+
+        # Immediately reset UI state on Qt main thread
         self._level_timer.stop()
         self.overlay.set_audio_bands([0.0] * 10)
         self.overlay.set_audio_level(0.0)
-        self.recorder.cancel()
         self._current_state = PillState.IDLE
         self.overlay.set_state(PillState.IDLE)
         self._update_tray_status("Ready")
         print(f"[{config.APP_NAME}] Dictation canceled.", flush=True)
         print(f"[{config.APP_NAME}] Ready.", flush=True)
+
+        # Stop and close audio stream asynchronously on worker thread
+        threading.Thread(
+            target=self.recorder.cancel,
+            daemon=True,
+            name="AudioCancelThread",
+        ).start()
 
     def _poll_audio_level(self) -> None:
         """Polled on Qt main thread every 33 ms while recording to update UI state and vocal waveform."""
@@ -763,25 +834,72 @@ class DictationApp:
             self.ui_bridge.hotkey_toggled.emit()
 
     # -------------------------------------------------------------------------
-    # Shutdown
+    # Shutdown & Restart
     # -------------------------------------------------------------------------
 
-    def stop_and_exit(self, app: QApplication) -> None:
-        """Clean up audio, listener, and overlay, then exit the application."""
+    def restart_and_reexec(self, app: QApplication) -> None:
+        """Cleanly shut down Spokn, release the instance lock, and re-exec the process."""
+        print(f"\n[{config.APP_NAME}] Restarting...", flush=True)
+        try:
+            self.stop_and_exit(app, do_sys_exit=False)
+        except Exception:
+            pass
+        release_single_instance_lock()
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except Exception as exc:
+            print(f"[{config.APP_NAME}] Restart failed: {exc}", flush=True)
+            os._exit(1)
+
+    def stop_and_exit(self, app: QApplication, do_sys_exit: bool = True) -> None:
+        """Clean up audio, listener, overlay, and lock, then exit the application."""
         print(f"\n[{config.APP_NAME}] Exiting cleanly...", flush=True)
-        self._level_timer.stop()
-        self.overlay.set_audio_bands([0.0] * 10)
-        self.tray_icon.hide()
+        try:
+            self._level_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._app_tracker_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.overlay.set_audio_bands([0.0] * 10)
+        except Exception:
+            pass
+        try:
+            self.tray_icon.hide()
+        except Exception:
+            pass
         if self.recorder.is_recording:
-            self.recorder.cancel()
+            try:
+                self.recorder.cancel()
+            except Exception:
+                pass
         if self._listener is not None and self._listener.is_alive():
-            self._listener.stop()
-        self.overlay.close()
-        app.quit()
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+        try:
+            self.overlay.close()
+        except Exception:
+            pass
+        release_single_instance_lock()
+
+        if do_sys_exit:
+            try:
+                app.quit()
+            except Exception:
+                pass
+            # Immediate Force Quit fallback so background threads or PortAudio handles never hang
+            os._exit(0)
 
 
 def main() -> None:
     """Entry point for Spokn."""
+    # Ensure only a single instance of Spokn runs at any time
+    acquire_single_instance_lock()
+
     app = QApplication.instance() or QApplication(sys.argv)
 
     # Heartbeat timer so Python signal handlers can execute inside Qt event loop
