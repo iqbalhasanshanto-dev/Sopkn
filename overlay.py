@@ -263,10 +263,15 @@ class DictationPillOverlay(QWidget):
             import AppKit
             import objc
 
+            # Set accessory activation policy so Python never appears in Dock or steals menu bar
+            activation_policy_accessory = getattr(AppKit, "NSApplicationActivationPolicyAccessory", 1)
+            AppKit.NSApp.setActivationPolicy_(activation_policy_accessory)
+
             NSFloatingWindowLevel = getattr(AppKit, "NSFloatingWindowLevel", 3)
             CAN_JOIN_ALL_SPACES = getattr(AppKit, "NSWindowCollectionBehaviorCanJoinAllSpaces", 1 << 0)
             STATIONARY = getattr(AppKit, "NSWindowCollectionBehaviorStationary", 1 << 4)
             FULL_SCREEN_AUX = getattr(AppKit, "NSWindowCollectionBehaviorFullScreenAuxiliary", 1 << 8)
+            NON_ACTIVATING_PANEL = getattr(AppKit, "NSWindowStyleMaskNonactivatingPanel", 1 << 7)
 
             ns_view = objc.objc_object(c_void_p=int(self.winId()))
             ns_window = ns_view.window() if ns_view is not None else None
@@ -275,6 +280,8 @@ class DictationPillOverlay(QWidget):
                 ns_window.setHidesOnDeactivate_(False)
                 # Float permanently above standard application windows
                 ns_window.setLevel_(NSFloatingWindowLevel)
+                # Non-activating panel style so mouse clicks never steal cursor focus from other apps
+                ns_window.setStyleMask_(ns_window.styleMask() | NON_ACTIVATING_PANEL)
                 # Display across all desktop Spaces, full-screen apps, and stay stationary
                 ns_window.setCollectionBehavior_(
                     CAN_JOIN_ALL_SPACES | FULL_SCREEN_AUX | STATIONARY

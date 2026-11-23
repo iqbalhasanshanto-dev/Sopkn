@@ -433,9 +433,9 @@ class DictationApp:
         self.ui_bridge.state_changed.connect(self.overlay.set_state)
 
         # Connect overlay interactive mouse events directly on Qt main thread
-        self.overlay.idle_clicked.connect(self.start_dictation)
-        self.overlay.cancel_clicked.connect(self.cancel_dictation)
-        self.overlay.stop_clicked.connect(self.stop_dictation)
+        self.overlay.idle_clicked.connect(self._on_pill_idle_clicked)
+        self.overlay.cancel_clicked.connect(self._on_pill_cancel_clicked)
+        self.overlay.stop_clicked.connect(self._on_pill_stop_clicked)
 
         # Audio recorder (no Qt callbacks inside audio thread)
         self.recorder = AudioRecorder()
@@ -456,7 +456,17 @@ class DictationApp:
         # Double-tap tracking state
         self._last_tap_time: float = 0.0
         self._other_key_pressed: bool = False
-        self._hotkey_held: bool = False
+        self._hotkey_is_down: bool = False
+
+        # Last active third-party application tracking (for focus restoration)
+        self._last_active_app: object | None = None
+        self._record_last_active_app()
+
+        # Polling timer to keep last active app updated every 300 ms
+        self._app_tracker_timer = QTimer(self.overlay)
+        self._app_tracker_timer.setInterval(300)
+        self._app_tracker_timer.timeout.connect(self._record_last_active_app)
+        self._app_tracker_timer.start()
 
         # Minimal macOS Menu-Bar Tray Icon
         self.tray_icon = QSystemTrayIcon(create_tray_icon(), self.overlay)
@@ -477,6 +487,52 @@ class DictationApp:
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.show()
 
+    def _record_last_active_app(self) -> None:
+        """Track the most recent frontmost application that is not Spokn/Python."""
+        try:
+            import os
+            import AppKit
+
+            workspace = AppKit.NSWorkspace.sharedWorkspace()
+            front_app = workspace.frontmostApplication()
+            if front_app is not None and front_app.processIdentifier() != os.getpid():
+                self._last_active_app = front_app
+        except Exception:
+            pass
+
+    def _restore_last_active_app(self) -> None:
+        """Re-activate the last active non-Spokn app so cursor focus is restored."""
+        try:
+            import os
+            import AppKit
+
+            if self._last_active_app is None:
+                self._record_last_active_app()
+
+            if self._last_active_app is None:
+                return
+
+            # NSApplicationActivateIgnoringOtherApps = 1 << 1
+            self._last_active_app.activateWithOptions_(1 << 1)
+            time.sleep(0.08)
+        except Exception:
+            pass
+
+    def _on_pill_idle_clicked(self) -> None:
+        """Pill clicked while idle -> restore target app focus and start recording."""
+        self._restore_last_active_app()
+        self.start_dictation()
+
+    def _on_pill_stop_clicked(self) -> None:
+        """Stop button clicked on pill -> restore target app focus and stop recording."""
+        self._restore_last_active_app()
+        self.stop_dictation()
+
+    def _on_pill_cancel_clicked(self) -> None:
+        """Cancel button clicked on pill -> restore target app focus and cancel recording."""
+        self._restore_last_active_app()
+        self.cancel_dictation()
+
     def _update_tray_status(self, status: str) -> None:
         """Update live status in the macOS menu bar tray menu."""
         if hasattr(self, "_status_action") and self._status_action is not None:
@@ -485,6 +541,19 @@ class DictationApp:
     def start(self) -> None:
         """Show overlay, start global keyboard listener, and warm up model in background."""
         self.overlay.show()
+
+        # Check accessibility permissions
+        try:
+            import ApplicationServices
+            if not ApplicationServices.AXIsProcessTrusted():
+                print(
+                    f"[{config.APP_NAME}] Warning: macOS Accessibility permissions are not yet enabled for Spokn.\n"
+                    f"    Please grant access in System Settings -> Privacy & Security -> Accessibility\n"
+                    f"    so Spokn can monitor Right Command double-taps and paste text automatically.",
+                    flush=True,
+                )
+        except Exception:
+            pass
 
         # Start pynput global keyboard listener in background thread
         self._listener = keyboard.Listener(
@@ -634,6 +703,7 @@ class DictationApp:
             else:
                 text = apply_corrections(text)
                 print(f"[{config.APP_NAME}] Transcribed: {text}", flush=True)
+                self._restore_last_active_app()
                 paste_text(text)
         finally:
             with self._lock:
@@ -661,10 +731,11 @@ class DictationApp:
             return
 
         # Target hotkey pressed
-        if not self._hotkey_held:
-            # Fresh press (not repeat while holding)
-            self._hotkey_held = True
-            self._other_key_pressed = False
+        if self._hotkey_is_down:
+            # Ignore macOS modifier key-repeat events so _last_tap_time is never reset during hold
+            return
+        self._hotkey_is_down = True
+        self._other_key_pressed = False
 
         if config.HOTKEY_MODE == "toggle":
             now = time.monotonic()
@@ -678,7 +749,7 @@ class DictationApp:
         if not is_hotkey:
             return
 
-        self._hotkey_held = False
+        self._hotkey_is_down = False
 
         if config.HOTKEY_MODE == "double_tap":
             if not self._other_key_pressed:
